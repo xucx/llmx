@@ -1,0 +1,126 @@
+syntax = "proto3";
+package llmx.api.v1;
+
+option go_package = "github.com/xucx/llmx/api/v1";
+
+service ApiService {
+  rpc Chat(ChatRequest) returns (ChatResponse);
+  rpc ChatStream(ChatStreamRequest) returns (stream ChatStreamResponse);
+  rpc ChatRealtime(stream ChatRealtimeRequest) returns (stream ChatRealtimeResponse);
+}
+
+// rpc messages
+message ChatRequest {
+  ChatParams chat_params = 1;
+}
+
+message ChatResponse {
+  ChatCompletion chat_completion = 1;
+}
+
+message ChatStreamRequest {
+  ChatParams chat_params = 1;
+}
+
+message ChatStreamResponse {
+  ChatCompletion chat_completion = 1;
+}
+
+message ChatRealtimeRequest {
+  message Init {
+    ChatParams chat_params = 1;
+  }
+
+  Init init = 1;
+  ChatMessage message = 2;
+}
+
+message ChatRealtimeResponse {
+  ChatCompletion chat_completion = 1;
+}
+
+// others
+message ChatParams {
+  string model = 1;
+  repeated ChatTool tools = 2;
+  string instructions = 3;
+  repeated ChatMessage messages = 4;
+  string voice = 5;
+  optional float temperature = 6;
+  optional float top_p = 7;
+  optional int32 top_k = 8;
+  optional int64 max_tokens = 9;
+  repeated string stop_sequences = 10;
+  optional int32 reasoning_level = 11;
+}
+
+message ChatMessage {
+  string id = 1;
+  string role = 2;
+  repeated ChatContent contents = 3;
+}
+
+message ChatTool {
+  string name = 1;
+  string desc = 2;
+  string params = 3;
+}
+
+message ChatContent {
+  oneof content {
+    ChatContentText text = 20;
+    ChatContentReasoning reasoning = 21;
+    ChatContentRefusal refusal = 22;
+    ChatContentToolCall tool_call = 23;
+    ChatContentToolResult tool_result = 24;
+    ChatContentAudio audio = 25;
+  }
+}
+
+message ChatContentText {
+  bool delta = 1;
+  string text = 2;
+}
+
+message ChatContentReasoning {
+  string text = 1;
+  string thoughtSignature = 2;
+}
+
+message ChatContentRefusal {
+  string text = 1;
+}
+
+message ChatContentToolCall {
+  string id = 1;
+  string name = 2;
+  string arguments = 3;
+}
+
+message ChatContentToolResult {
+  string id = 1;
+  string name = 2;
+  string result = 3;
+}
+
+message ChatContentAudio {
+  bool delta = 1;
+  string data = 2;
+  string format = 3;
+  string transcript = 4;
+}
+
+message ChatUsage {
+  int64 prompt_tokens = 1;
+  int64 completion_tokens = 2;
+  int64 total_tokens = 3;
+  int64 reasoning_tokens = 4;
+}
+
+message ChatCompletion {
+  bool delta = 1;
+  string model = 2;
+  ChatMessage message = 3;
+  ChatUsage usage = 4;
+  string id = 5;
+}
