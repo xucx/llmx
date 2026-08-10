@@ -44,7 +44,3 @@ $(PLATFORMS):
 
 	GOOS=$(os) GOARCH=$(arch) go build -o ${DIST}/${EXE}-$(os)-$(arch)${suffix} ${BUILD_OPTS} $(CURDIR)/cmd
 
-
-.PHONY: docker
-docker:
-	docker build -t ${PROJECT}:$(VERSION) .
