@@ -333,3 +333,61 @@ func TestCompressSummaryTokensUseInputMinusSummaryReduction(t *testing.T) {
 		t.Fatalf("unexpected summary bridge: %+v", compression.Summary.Message)
 	}
 }
+
+func TestCompressSummaryKeepsUserPromptsAcrossRepeatedSummaries(t *testing.T) {
+	models := NewModels()
+	models.models["fake"] = &Model{
+		Name:     "fake",
+		Model:    "fake-provider-model",
+		MaxToken: 100,
+		Provider: compressTestProvider{completion: &types.Completion{
+			Message: types.NewTextMessage(types.MessageRoleAssistant, "summary"),
+		}},
+	}
+	summarize := func(history []*types.Message) *types.Message {
+		t.Helper()
+		events, err := Compress(t.Context(), models, &CompressInput{
+			Model:    "fake",
+			Messages: history,
+			Tokens:   90,
+			Options: &CompressOptions{
+				SummaryLevel:     0.5,
+				SummaryBridgeTag: "summary",
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(events) != 1 || events[0].Compression == nil ||
+			events[0].Compression.Summary == nil {
+			t.Fatalf("unexpected compression events: %+v", events)
+		}
+		compressed, _, err := ApplyCompression(history, events[0].Compression)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return compressed[0]
+	}
+
+	first := summarize([]*types.Message{
+		types.NewTextMessage(types.MessageRoleUser, "first question"),
+		types.NewTextMessage(types.MessageRoleAssistant, "first answer"),
+	})
+	second := summarize([]*types.Message{
+		first,
+		types.NewTextMessage(types.MessageRoleUser, "second question"),
+		types.NewTextMessage(types.MessageRoleAssistant, "second answer"),
+	})
+
+	// The second bridge must list the prompts the first bridge replaced, and
+	// must not list the first bridge itself as a prompt.
+	if got, want := second.GetState(summaryUserPromptsState),
+		`["first question","second question"]`; got != want {
+		t.Fatalf("unexpected carried prompts: %s, want %s", got, want)
+	}
+	text := second.Parts[0].Text.TextWithInstruction()
+	if !strings.Contains(text, "- first question") ||
+		!strings.Contains(text, "- second question") {
+		t.Fatalf("bridge lost user prompts: %s", text)
+	}
+}

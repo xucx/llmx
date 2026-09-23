@@ -5,6 +5,7 @@ import (
 	"cmp"
 	"context"
 	_ "embed"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Masterminds/sprig/v3"
+	"github.com/xucx/gox/logx"
 	"github.com/xucx/llmx/types"
 )
 
@@ -23,6 +25,11 @@ var defaultCompressInstruction string
 var defaultCompressBridge string
 
 const defaultToolResultReplace = "The tool call results have been omitted to save context. You may call the tool again if needed"
+
+// summaryUserPromptsState is the bridge state key holding, as a JSON string
+// list, every user prompt the bridge replaced. A later summary expands it
+// instead of reading the bridge text, so prompts survive repeated summaries.
+const summaryUserPromptsState = "llmx.compress.userPrompts"
 
 type CompressOptions struct {
 	// KeepLastTurn is the number of recent user turns left unchanged.
@@ -275,6 +282,11 @@ func summaryCompressor(models *Models, chatModel *Model, options *CompressOption
 				summary.Summary,
 			)
 		}
+		userPrompts, err := json.Marshal(summary.UserPrompts)
+		if err != nil {
+			return nil, err
+		}
+		bridge.SetState(summaryUserPromptsState, string(userPrompts))
 
 		compression := &EventCompression{
 			Summary:        &CompressResultSummary{Message: bridge},
@@ -456,6 +468,9 @@ type compressSummaryResult struct {
 	UntilMessageID string            `json:"untilMessageId"`
 	Completion     *types.Completion `json:"completion"`
 	Summary        string            `json:"summary"`
+	// UserPrompts is every user prompt the summary replaced, including those
+	// carried by bridges of earlier summaries.
+	UserPrompts []string `json:"userPrompts"`
 }
 
 func compressSummary(
@@ -469,6 +484,9 @@ func compressSummary(
 	if len(composed) == 0 {
 		return result, nil
 	}
+
+	logx.Debug("start compress summary")
+
 	// The summary is addressed by the message it ends at, so an unidentified
 	// boundary has to fail before the summary is paid for.
 	until := composed[len(composed)-1].ID
@@ -501,6 +519,23 @@ func compressSummary(
 		return nil, errors.New("llm return no text")
 	}
 
+	userPrompts := make([]string, 0)
+	for _, message := range composed {
+		// A bridge of an earlier summary stands for the prompts it replaced,
+		// its own text is not a user prompt.
+		if carried := message.GetState(summaryUserPromptsState); carried != "" {
+			var prompts []string
+			if err := json.Unmarshal([]byte(carried), &prompts); err != nil {
+				return nil, err
+			}
+			userPrompts = append(userPrompts, prompts...)
+			continue
+		}
+		if message.Role == types.MessageRoleUser && message.Text() != "" {
+			userPrompts = append(userPrompts, message.Text())
+		}
+	}
+
 	bridgeSummary := summary
 	if bridge != "" {
 		bridgeTemplate, err := template.New("bridge").
@@ -508,12 +543,6 @@ func compressSummary(
 			Parse(bridge)
 		if err != nil {
 			return nil, err
-		}
-		userPrompts := make([]string, 0)
-		for _, message := range composed {
-			if message.Role == types.MessageRoleUser && message.Text() != "" {
-				userPrompts = append(userPrompts, message.Text())
-			}
 		}
 		var buffer bytes.Buffer
 		if err := bridgeTemplate.Execute(&buffer, &bridgeParams{
@@ -527,6 +556,7 @@ func compressSummary(
 
 	result.UntilMessageID = until
 	result.Summary = bridgeSummary
+	result.UserPrompts = userPrompts
 	return result, nil
 }
 
