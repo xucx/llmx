@@ -31,15 +31,7 @@ var (
 	_allProvidersMu sync.RWMutex
 )
 
-const ProviderOpenai = ProviderOpenAI
-
 type ProviderCreator func(opts ...types.ProviderOption) (types.Provider, error)
-
-func RegistProviderCreator(name string, Creator ProviderCreator) {
-	if err := RegisterProviderCreator(name, Creator); err != nil {
-		panic(err)
-	}
-}
 
 func RegisterProviderCreator(name string, creator ProviderCreator) error {
 	if name == "" {

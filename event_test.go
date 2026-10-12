@@ -41,12 +41,11 @@ func TestEventStateAllowsEmptyReplacementButNotEmptyPatch(t *testing.T) {
 	}
 }
 
-func TestNewSessionAppliesCompressionAndIgnoresDelta(t *testing.T) {
+func TestNewAgentRestoresHistoryAndIgnoresDelta(t *testing.T) {
 	original := types.NewTextMessage(types.MessageRoleUser, "original")
 	delta := types.NewTextMessage(types.MessageRoleAssistant, "partial")
 	delta.Delta = true
 	kept := types.NewTextMessage(types.MessageRoleAssistant, "kept")
-	summary := types.NewTextMessage(types.MessageRoleUser, "summary")
 	latest := types.NewTextMessage(types.MessageRoleUser, "latest")
 
 	events := []*Event{
@@ -54,64 +53,50 @@ func TestNewSessionAppliesCompressionAndIgnoresDelta(t *testing.T) {
 		NewEventMessage(delta),
 		NewEventMessage(kept),
 		NewEventUsage(types.CompletionUsage{PromptTokens: 9, TotalTokens: 9}),
-		NewEventCompression(&EventCompression{
-			Summary: &CompressResultSummary{
-				Message: summary,
-				// The reduction is derived from this usage on apply:
-				// 8 prompt - 2 completion = 6 tokens removed.
-				Usage: types.CompletionUsage{
-					PromptTokens:     8,
-					CompletionTokens: 2,
-					TotalTokens:      10,
-				},
-			},
-			UntilMessageID: original.ID,
-		}),
 		NewEventMessage(latest),
 		NewEventState(map[string]string{"key": "value"}, true),
 	}
 
-	agent, err := NewAgent("test", "", NewModels(), WithModel("test"))
+	factory, err := newAgentFactory(NewModels(), WithModel("test"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	session, err := NewSession(agent, events)
+	agent, err := factory.build(events)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The summary covers the original message only, so the message after the
-	// boundary survives it.
-	if len(session.history) != 3 ||
-		session.history[0].Text() != "summary" ||
-		session.history[1].Text() != "kept" ||
-		session.history[2].Text() != "latest" {
-		t.Fatalf("unexpected session history: %+v", session.history)
+	// A delta is a streaming fragment, never history.
+	history := agent.session.history()
+	if len(history) != 3 ||
+		history[0].Text() != "original" ||
+		history[1].Text() != "kept" ||
+		history[2].Text() != "latest" {
+		t.Fatalf("unexpected agent history: %+v", history)
 	}
-	// A compression is not a reported context size: it only says how much it
-	// removed, so restoring it subtracts that from the last reported size.
-	if session.contextTokens != 3 {
-		t.Fatalf("unexpected session context tokens: %d", session.contextTokens)
+	if agent.session.state["key"] != "value" {
+		t.Fatalf("unexpected agent state: %+v", agent.session.state)
 	}
-	if session.state["key"] != "value" {
-		t.Fatalf("unexpected session state: %+v", session.state)
+	// The delta is dropped; every other event is retained by reference.
+	restored := append(append([]*Event(nil), events[:1]...), events[2:]...)
+	if len(agent.session.events) != len(restored) {
+		t.Fatalf("unexpected restored events: %+v", agent.session.events)
 	}
-	for index, event := range events {
-		if session.events[index] != event {
+	for index, event := range restored {
+		if agent.session.events[index] != event {
 			t.Fatalf("history event %d was cloned", index)
 		}
 	}
 }
 
-func TestNewSessionValidatesHumanCorrelation(t *testing.T) {
-	agent, err := NewAgent("test", "", NewModels(), WithModel("test"))
+func TestNewAgentValidatesHumanCorrelation(t *testing.T) {
+	agent, err := newAgentFactory(NewModels(), WithModel("test"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	unknown := NewEventHumanResponse(&EventHumanResponse{
 		ID: "missing",
 	})
-	if _, err := NewSession(
-		agent,
+	if _, err := agent.build(
 		[]*Event{unknown},
 	); err == nil {
 		t.Fatal("expected unknown human request error")
@@ -135,8 +120,7 @@ func TestNewSessionValidatesHumanCorrelation(t *testing.T) {
 	duplicate := NewEventHumanResponse(&EventHumanResponse{
 		ID: "request",
 	})
-	if _, err := NewSession(
-		agent,
+	if _, err := agent.build(
 		[]*Event{
 			NewEventMessage(assistant),
 			request,
@@ -167,5 +151,27 @@ func TestEventCloneOwnsNestedInput(t *testing.T) {
 	nested := responseEvent.HumanResponse.Result["nested"].(map[string]any)
 	if nested["value"] != "before" {
 		t.Fatalf("constructor retained caller result: %+v", responseEvent)
+	}
+}
+
+func TestStatusEventStopReasonExactlyWhenNotRunning(t *testing.T) {
+	cases := []struct {
+		status EventStatus
+		valid  bool
+	}{
+		{EventStatus{Status: StatusRunning}, true},
+		{EventStatus{Status: StatusWaiting, StopReason: StopInterrupted, Turns: 1}, true},
+		{EventStatus{Status: StatusStopped, StopReason: StopMaxTurn}, true},
+		{EventStatus{}, false},
+		{EventStatus{Status: StatusRunning, StopReason: StopDone}, false},
+		{EventStatus{Status: StatusWaiting, Turns: 1}, false},
+		{EventStatus{Status: StatusStopped}, false},
+	}
+	for _, tc := range cases {
+		status := tc.status
+		err := (&Event{ID: "status", Status: &status}).Validate()
+		if (err == nil) != tc.valid {
+			t.Fatalf("status %+v: valid=%v, got err %v", tc.status, tc.valid, err)
+		}
 	}
 }

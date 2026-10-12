@@ -528,6 +528,7 @@ type MessageToolResult struct {
 	Result      string              `json:"result,omitempty" yaml:"result,omitempty"`
 	Error       string              `json:"error,omitempty" yaml:"error,omitempty"`
 	Instruction map[string][]string `json:"instruction,omitempty" yaml:"instruction,omitempty"`
+	Final       bool                `json:"final,omitempty" yaml:"final,omitempty"`
 }
 
 func NewToolResultMessage(id, name, result, error string, instructions ...string) *Message {

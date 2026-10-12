@@ -9,15 +9,15 @@ import (
 )
 
 // Event is a oneof envelope. Exactly one payload field must be non-nil. Once
-// accepted by a Session, an Event and its nested values are immutable; callers
-// must Clone before modifying them.
+// appended to an event stream, an Event and its nested values are immutable;
+// callers must Clone before modifying them.
 type Event struct {
 	ID string `json:"id,omitempty" yaml:"id,omitempty"`
 
+	Status        *EventStatus        `json:"status,omitempty" yaml:"status,omitempty"`
 	Message       *types.Message      `json:"message,omitempty" yaml:"message,omitempty"`
 	HumanRequest  *EventHumanRequest  `json:"humanRequest,omitempty" yaml:"humanRequest,omitempty"`
 	HumanResponse *EventHumanResponse `json:"humanResponse,omitempty" yaml:"humanResponse,omitempty"`
-	Compression   *EventCompression   `json:"compression,omitempty" yaml:"compression,omitempty"`
 	Usage         *EventUsage         `json:"usage,omitempty" yaml:"usage,omitempty"`
 	State         *EventState         `json:"state,omitempty" yaml:"state,omitempty"`
 }
@@ -33,34 +33,6 @@ type EventHumanResponse struct {
 	Result map[string]any `json:"result,omitempty" yaml:"result,omitempty"`
 }
 
-// EventCompression is one self-contained compression: the range it covers and
-// the transform it applies to that range. How much context the transform
-// removed is not stored; ApplyCompression derives it from the event, so
-// generating and replaying a compression always report the same reduction.
-type EventCompression struct {
-	//one of
-	ToolResult *CompressResultToolResult `json:"toolResult,omitempty" yaml:"toolResult,omitempty"`
-	Summary    *CompressResultSummary    `json:"summary,omitempty" yaml:"summary,omitempty"`
-
-	// UntilMessageID is the last history message this compression covers,
-	// inclusive. Messages after it are left unchanged.
-	UntilMessageID string `json:"untilMessageID,omitempty" yaml:"untilMessageID,omitempty"`
-}
-
-type CompressResultToolResult struct {
-	Result       string            `json:"result,omitempty" yaml:"result,omitempty"`
-	Instructions map[string]string `json:"instructions,omitempty" yaml:"instructions,omitempty"`
-}
-
-// CompressResultSummary replaces the whole covered range with one bridge
-// message. The messages it replaces stay in the event log, so only the bridge
-// itself has to be stored here. Usage is from the summary call that wrote the
-// bridge: it read the range the bridge replaces, so the reduction this
-// compression achieves is derived from it when the event is applied.
-type CompressResultSummary struct {
-	Message *types.Message        `json:"message,omitempty" yaml:"message,omitempty"`
-	Usage   types.CompletionUsage `json:"usage,omitempty" yaml:"usage,omitempty"`
-}
 type EventUsage struct {
 	Usage types.CompletionUsage `json:"usage,omitempty" yaml:"usage,omitempty"`
 }
@@ -68,6 +40,55 @@ type EventUsage struct {
 type EventState struct {
 	Patch bool              `json:"patch,omitempty" yaml:"patch,omitempty"`
 	State map[string]string `json:"state,omitempty" yaml:"state,omitempty"`
+}
+
+// Status is the run state of an agent.
+type Status string
+
+const (
+	// StatusRunning means a task started: it appends its inputs, resumes
+	// answered human requests and runs model turns.
+	StatusRunning Status = "running"
+	// StatusWaiting means the task ended and the agent waits for the next one;
+	// StopReason tells how the task ended.
+	StatusWaiting Status = "waiting"
+	// StatusStopped means the agent closes; StopReason tells why.
+	StatusStopped Status = "stopped"
+)
+
+// StopReason tells why a task or an agent stopped.
+type StopReason string
+
+const (
+	// StopDone means Loop finished the task, or stopped the agent.
+	StopDone StopReason = "done"
+	// StopMaxTurn means the task used up MaxTurn; the agent closes.
+	StopMaxTurn StopReason = "maxTurn"
+	// StopInterjected means an interjection ended the task at a turn boundary.
+	StopInterjected StopReason = "interjected"
+	// StopInterrupted means an interruption canceled the task in flight.
+	StopInterrupted StopReason = "interrupted"
+	// StopRejected means the stream rejected the inputs of the task, which
+	// appended nothing; the agent waits for the next one.
+	StopRejected StopReason = "rejected"
+	// StopCanceled and StopError only appear in a Result: the agent closed
+	// because its context was canceled or an error occurred.
+	StopCanceled StopReason = "canceled"
+	StopError    StopReason = "error"
+)
+
+// EventStatus records one change of the agent run state. Every task is
+// bracketed by a running status and a waiting (or stopped) status, so a caller
+// rendering the event stream knows when a reply is complete. An agent closed by
+// an error or a canceled context appends no closing status; Runner.Wait or the
+// Run result report it instead. It changes no state, so replaying it is a no-op.
+type EventStatus struct {
+	Status Status `json:"status,omitempty" yaml:"status,omitempty"`
+	// StopReason is set exactly when Status is waiting or stopped.
+	StopReason StopReason `json:"stopReason,omitempty" yaml:"stopReason,omitempty"`
+	// Turns is the number of model turns the task ran, the count MaxTurn
+	// bounds. It is zero for StatusRunning.
+	Turns int `json:"turns,omitempty" yaml:"turns,omitempty"`
 }
 
 // NewEventMessage wraps one message into one event: a message is the unit of
@@ -85,10 +106,6 @@ func NewEventHumanRequest(request *EventHumanRequest) *Event {
 
 func NewEventHumanResponse(response *EventHumanResponse) *Event {
 	return &Event{ID: uuid.NewString(), HumanResponse: response.Clone()}
-}
-
-func NewEventCompression(compression *EventCompression) *Event {
-	return &Event{ID: uuid.NewString(), Compression: compression.Clone()}
 }
 
 func NewEventUsage(usage types.CompletionUsage) *Event {
@@ -115,9 +132,9 @@ func (e *Event) Validate() error {
 		e.Message != nil,
 		e.HumanRequest != nil,
 		e.HumanResponse != nil,
-		e.Compression != nil,
 		e.Usage != nil,
 		e.State != nil,
+		e.Status != nil,
 	} {
 		if present {
 			fields++
@@ -146,25 +163,19 @@ func (e *Event) Validate() error {
 		if e.HumanResponse.ID == "" {
 			return fmt.Errorf("event %q human response request id is empty", e.ID)
 		}
-	case e.Compression != nil:
-		if e.Compression.ToolResult == nil && e.Compression.Summary == nil {
-			return fmt.Errorf("event %q compression messages are empty", e.ID)
-		}
-		if e.Compression.ToolResult != nil && e.Compression.Summary != nil {
-			return fmt.Errorf("event %q compression has 2 results, want 1", e.ID)
-		}
-		if e.Compression.UntilMessageID == "" {
-			return fmt.Errorf("event %q compression until message id is empty", e.ID)
-		}
-		if e.Compression.Summary != nil && e.Compression.Summary.Message == nil {
-			return fmt.Errorf("event %q compression summary message is nil", e.ID)
-		}
 	case e.State != nil:
 		if e.State.Patch && len(e.State.State) == 0 {
 			return fmt.Errorf("event %q state patch is empty", e.ID)
 		}
 		if err := validateState(e.State.State); err != nil {
 			return fmt.Errorf("event %q state: %w", e.ID, err)
+		}
+	case e.Status != nil:
+		if e.Status.Status == "" {
+			return fmt.Errorf("event %q status is empty", e.ID)
+		}
+		if (e.Status.Status != StatusRunning) != (e.Status.StopReason != "") {
+			return fmt.Errorf("event %q stop reason must be set exactly when not running", e.ID)
 		}
 	}
 	return nil
@@ -184,15 +195,16 @@ func (e *Event) Clone() *Event {
 	if e.HumanResponse != nil {
 		clone.HumanResponse = e.HumanResponse.Clone()
 	}
-	if e.Compression != nil {
-		clone.Compression = e.Compression.Clone()
-	}
 	if e.Usage != nil {
 		value := *e.Usage
 		clone.Usage = &value
 	}
 	if e.State != nil {
 		clone.State = &EventState{State: maps.Clone(e.State.State), Patch: e.State.Patch}
+	}
+	if e.Status != nil {
+		value := *e.Status
+		clone.Status = &value
 	}
 	return clone
 }
@@ -216,27 +228,6 @@ func (e *EventHumanResponse) Clone() *EventHumanResponse {
 	}
 	clone := *e
 	clone.Result = cloneAnyMap(e.Result)
-	return &clone
-}
-
-func (e *EventCompression) Clone() *EventCompression {
-	if e == nil {
-		return nil
-	}
-	clone := *e
-	if e.ToolResult != nil {
-		clone.ToolResult = &CompressResultToolResult{
-			Result:       e.ToolResult.Result,
-			Instructions: maps.Clone(e.ToolResult.Instructions),
-		}
-	}
-	if e.Summary != nil {
-		clone.Summary = &CompressResultSummary{
-			Message: e.Summary.Message.Clone(),
-			Usage:   e.Summary.Usage,
-		}
-	}
-
 	return &clone
 }
 

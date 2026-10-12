@@ -10,7 +10,6 @@ import (
 )
 
 const OutputSchemaInstruction = "<|output_json_schema|>"
-const OUTPUT_SCHEMA_INSTRUCTION = OutputSchemaInstruction
 
 func RunCompletionTask[T any](ctx context.Context, m *Model, prompt string, failRetry int, options ...types.CompletionOption) (*T, error) {
 	if m == nil {
