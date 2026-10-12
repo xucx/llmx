@@ -44,10 +44,21 @@ func (p *ProxyProvider) Completion(ctx context.Context, model string, messages [
 		acc := accChatCompletion{
 			Completion: &v1.ChatCompletion{},
 		}
+		// 取消必须显式失败，同时带回已累计的内容，由调用方决定是否落库
+		canceled := func() (*types.Completion, error) {
+			completion, err := ToChatCompletion(acc.Completion)
+			if err != nil {
+				return nil, context.Cause(ctx)
+			}
+			return completion, context.Cause(ctx)
+		}
 
 		for {
 			rsp, err := stream.Recv()
 			if err != nil {
+				if ctx.Err() != nil {
+					return canceled()
+				}
 				if errors.Is(err, io.EOF) {
 					return nil, errors.New("not finished")
 				}

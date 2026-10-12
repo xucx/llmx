@@ -9,6 +9,9 @@ import (
 
 type Provider interface {
 	Embedding(ctx context.Context, model string, input []string, options ...EmbeddingOption) (*Embedding, error)
+	// Completion calls the model. When ctx is canceled during a streaming
+	// call, it returns the completion received so far along with the
+	// cancellation error; the completion may hold truncated tool calls.
 	Completion(ctx context.Context, model string, messages []*Message, options ...CompletionOption) (*Completion, error)
 	Realtime(ctx context.Context, model string, messages []*Message, options ...RealTimeOption) (RealTimeSession, error)
 	Rerank(ctx context.Context, model string, input *RerankInput, options ...RerankOption) (*RerankOutput, error)

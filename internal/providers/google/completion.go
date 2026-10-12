@@ -42,9 +42,21 @@ func (p *GoogleProvider) Completion(ctx context.Context, model string, messages 
 	} else {
 		rsp = &genai.GenerateContentResponse{}
 
+		// 取消必须显式失败，同时带回已累计的内容，由调用方决定是否落库
+		canceled := func() (*types.Completion, error) {
+			completion, err := fromChatCompletion(rsp, false)
+			if err != nil {
+				return nil, context.Cause(ctx)
+			}
+			return completion, context.Cause(ctx)
+		}
+
 		stream := p.client.Models.GenerateContentStream(ctx, model, contents, config)
 		for chunck, err := range stream {
 			if err != nil {
+				if ctx.Err() != nil {
+					return canceled()
+				}
 				return nil, err
 			}
 
@@ -73,6 +85,9 @@ func (p *GoogleProvider) Completion(ctx context.Context, model string, messages 
 				}
 			}
 
+		}
+		if ctx.Err() != nil {
+			return canceled()
 		}
 	}
 

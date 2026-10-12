@@ -149,7 +149,8 @@ func callModelWithfallback[T any](ctx context.Context, m *Model, call func(types
 			return result, nil
 		}
 		if ctx.Err() != nil {
-			return zero, context.Cause(ctx)
+			// A canceled call keeps what it received so far.
+			return result, context.Cause(ctx)
 		}
 		if !fallbackEligible(err) {
 			return zero, fmt.Errorf("primary model %q: %w", m.Model, err)
@@ -176,6 +177,9 @@ func callModelWithfallback[T any](ctx context.Context, m *Model, call func(types
 			m.Fallback.lastIndex = index
 			m.Fallback.mu.Unlock()
 			return result, nil
+		}
+		if ctx.Err() != nil {
+			return result, context.Cause(ctx)
 		}
 		callErrors = append(callErrors, fmt.Errorf(
 			"fallback provider %q model %q: %w",

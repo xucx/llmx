@@ -107,19 +107,29 @@ func (p *OpenaiProvider) Completion(ctx context.Context, model string, messages 
 	}
 
 	rsp := &CompletionRsp{}
+	// 取消必须显式失败，同时带回已累计的内容，由调用方决定是否落库
+	canceled := func() (*types.Completion, error) {
+		completion, err := p.fromCompletion(rsp, false)
+		if err != nil {
+			return nil, context.Cause(ctx)
+		}
+		return completion, context.Cause(ctx)
+	}
 
 loop:
 	for {
 		select {
 		case <-ctx.Done():
-			// 取消必须显式失败：不返回 partial completion，调用方不落库、不执行工具
-			return nil, context.Cause(ctx)
+			return canceled()
 		case event, ok := <-ch:
 			if !ok {
 				break loop
 			}
 
 			if event.Err != nil {
+				if ctx.Err() != nil {
+					return canceled()
+				}
 				return nil, event.Err
 			}
 
@@ -152,6 +162,10 @@ loop:
 		}
 	}
 
+	// 取消会关闭响应体，SSE 随之结束，截断的流不能当作正常完成
+	if ctx.Err() != nil {
+		return canceled()
+	}
 	return p.fromCompletion(rsp, false)
 }
 
