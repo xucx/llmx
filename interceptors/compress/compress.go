@@ -100,17 +100,14 @@ func (o *Options) normalized() *Options {
 // The event stream itself is never rewritten. Before every model call, every
 // compression recorded in the stream is applied to the messages sent to the
 // model, and a newly needed compression is recorded as a state patch appended
-// to the stream. An agent restored from its event stream therefore keeps its
-// compressions as long as it is configured with this interceptor. LLM
-// interceptors registered before it see the uncompressed messages, those after
-// it the compressed ones.
+// to the stream. A session replayed with this interceptor therefore keeps its
+// compressions. Interceptors registered before it see the uncompressed
+// messages, those after it the compressed ones.
 func New(models *llmx.Models, options Options) llmx.Interceptor {
 	return &interceptor{models: models, options: options}
 }
 
 type interceptor struct {
-	llmx.NopInterceptor
-
 	models  *llmx.Models
 	options Options
 }
@@ -119,8 +116,8 @@ type interceptor struct {
 // goes wrong is logged and the call goes on with the history compressed as far
 // as it could be. A context that really is too large is left to the model call
 // to report.
-func (i *interceptor) InterceptLLM(next llmx.LLMHandler) llmx.LLMHandler {
-	return func(ctx llmx.LLMContext) (*types.Completion, error) {
+func (i *interceptor) InterceptModel(next llmx.ModelHandler) llmx.ModelHandler {
+	return func(ctx llmx.ModelContext) (*types.Completion, error) {
 		events := ctx.Events()
 		request := ctx.Request()
 		messages := request.Messages
@@ -162,9 +159,9 @@ func (i *interceptor) InterceptLLM(next llmx.LLMHandler) llmx.LLMHandler {
 			if err == nil && compression != nil {
 				var data []byte
 				if data, err = json.Marshal(compression); err == nil {
-					err = ctx.Append(llmx.NewEventState(map[string]string{
+					err = ctx.Append(llmx.NewPatchEvent(map[string]string{
 						compressionStatePrefix + strconv.Itoa(count): string(data),
-					}, true))
+					}, false))
 				}
 			}
 			switch {

@@ -3,18 +3,31 @@ package llmx
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/bytedance/sonic"
 	"github.com/google/jsonschema-go/jsonschema"
-	"github.com/google/uuid"
-	"github.com/xucx/llmx/types"
 )
 
+// ToolContext is what a tool runs with.
+type ToolContext interface {
+	context.Context
+	// Call is the call being answered.
+	Call() ToolCall
+	// Answer is set when the tool runs again after it asked; nil otherwise.
+	Answer() *ToolAnswer
+	// State is the key-value state of the conversation.
+	State() map[string]string
+	// Events is the conversation so far.
+	Events() []*Event
+}
+
+// ToolInvoker answers a tool call. It returns a plain value, an *Output, an
+// *Ask, or an error.
 type ToolInvoker func(ToolContext, string) (any, error)
 
+// Tool is a tool with its implementation. Spec declares it to the model.
 type Tool struct {
 	Name        string
 	Description string
@@ -22,6 +35,39 @@ type Tool struct {
 	Invoker     ToolInvoker
 }
 
+func (t *Tool) Spec() ToolSpec {
+	return ToolSpec{Name: t.Name, Description: t.Description, Parameters: cloneAnyMap(t.Parameters)}
+}
+
+// Specs declares tools.
+func Specs(tools ...*Tool) []ToolSpec {
+	specs := make([]ToolSpec, 0, len(tools))
+	for _, tool := range tools {
+		specs = append(specs, tool.Spec())
+	}
+	return specs
+}
+
+// Output is what a tool returns when a plain value is not enough.
+type Output struct {
+	// Value is shown to the model: a string as is, anything else as JSON.
+	Value any
+	// Instruction adds tagged instructions to the result the model sees.
+	Instruction map[string]string
+	// Final marks a result the model need not answer.
+	Final bool
+	// Patch records a key-value state change alongside the result.
+	Patch map[string]string
+}
+
+// Ask is what a tool returns to ask a question before answering: the call
+// stays pending until a ToolAnswer arrives, then the tool runs again with
+// Answer set in its context.
+type Ask struct {
+	Args map[string]any
+}
+
+// NewTool builds a tool whose argument schema is derived from T.
 func NewTool[T any](name string, desc string, invoker func(ToolContext, *T) (any, error)) (*Tool, error) {
 	if name == "" {
 		return nil, fmt.Errorf("tool name is empty")
@@ -33,36 +79,29 @@ func NewTool[T any](name string, desc string, invoker func(ToolContext, *T) (any
 	if err != nil {
 		return nil, fmt.Errorf("build tool %q parameter schema: %w", name, err)
 	}
-
 	resolved, err := schema.Resolve(nil)
 	if err != nil {
 		return nil, fmt.Errorf("resolve tool %q parameter schema: %w", name, err)
 	}
-
 	schemaBytes, err := resolved.Schema().MarshalJSON()
 	if err != nil {
 		return nil, fmt.Errorf("marshal tool %q parameter schema: %w", name, err)
 	}
-
 	parameters := map[string]any{}
 	if err := json.Unmarshal(schemaBytes, &parameters); err != nil {
 		return nil, fmt.Errorf("decode tool %q parameter schema: %w", name, err)
 	}
-
-	invokerWrapp := func(ctx ToolContext, args string) (any, error) {
-		param, err := unmarshalToolArgs[T](args)
-		if err != nil {
-			return nil, fmt.Errorf("invalid tool arguments: %w", err)
-		}
-
-		return invoker(ctx, param)
-	}
-
 	return &Tool{
 		Name:        name,
 		Description: desc,
 		Parameters:  parameters,
-		Invoker:     invokerWrapp,
+		Invoker: func(ctx ToolContext, args string) (any, error) {
+			param, err := unmarshalToolArgs[T](args)
+			if err != nil {
+				return nil, fmt.Errorf("invalid tool arguments: %w", err)
+			}
+			return invoker(ctx, param)
+		},
 	}, nil
 }
 
@@ -74,13 +113,26 @@ func MustNewTool[T any](name string, desc string, invoker func(ToolContext, *T) 
 	return tool
 }
 
+// NewRawTool builds a tool from a hand-written JSON schema.
+func NewRawTool(name, desc string, parameters map[string]any, invoker ToolInvoker) (*Tool, error) {
+	if name == "" {
+		return nil, fmt.Errorf("tool name is empty")
+	}
+	if invoker == nil {
+		return nil, fmt.Errorf("tool %q invoker is nil", name)
+	}
+	return &Tool{Name: name, Description: desc, Parameters: cloneAnyMap(parameters), Invoker: invoker}, nil
+}
+
 func unmarshalToolArgs[T any](args string) (*T, error) {
 	param := new(T)
+	if strings.TrimSpace(args) == "" {
+		args = "{}"
+	}
 	err := json.Unmarshal([]byte(args), param)
 	if err == nil {
 		return param, nil
 	}
-
 	// vllm bug, missing end "}" with nesting json
 	var retryArgs strings.Builder
 	retryArgs.WriteString(args)
@@ -90,262 +142,121 @@ func unmarshalToolArgs[T any](args string) (*T, error) {
 			return param, nil
 		}
 	}
-
 	return nil, err
 }
 
-// ToolResult is what a tool returns, by value or by pointer, when a plain
-// value is not enough. Exactly one of Result and AskHuman must be set. Any
-// other value a tool returns is the Value of its Result. A tool that returns an
-// error alongside AskHuman answers with the error: the request is dropped.
-type ToolResult struct {
-	// Result answers the tool call.
-	Result *ToolOutput
-	// AskHuman answers nothing yet: a human request is appended instead, and
-	// the tool runs again once a human answers it.
-	AskHuman *ToolAskHuman
-}
-
-// ToolOutput is the answer of a tool call.
-type ToolOutput struct {
-	// Value is shown to the model: a string as is, anything else as JSON.
-	Value any
-	// Instruction adds tagged instructions to the result the model sees.
-	Instruction map[string]string
-	// Final marks a result the model need not answer: alone, it starts no turn.
-	Final bool
-}
-
-// ToolAskHuman is the human request a tool raises instead of answering.
-type ToolAskHuman struct {
-	// Arguments tell the human what is asked.
-	Arguments map[string]any
-}
-
-// asToolResult returns what a tool returned as a ToolResult with exactly one
-// of Result and AskHuman set.
-func asToolResult(value any) (*ToolResult, error) {
-	var result *ToolResult
-	switch value := value.(type) {
-	case ToolResult:
-		result = &value
-	case *ToolResult:
-		result = value
-	default:
-		return &ToolResult{Result: &ToolOutput{Value: value}}, nil
+// ToolExecutor performs the tool calls of the tools it holds. A call that
+// asked and has no answer yet is left to a HumanExecutor.
+func ToolExecutor(tools ...*Tool) Executor {
+	byName := make(map[string]*Tool, len(tools))
+	for _, tool := range tools {
+		if tool != nil && tool.Name != "" {
+			byName[tool.Name] = tool
+		}
 	}
-	if result == nil {
-		return nil, fmt.Errorf("nil *ToolResult")
-	}
-	if (result.Result == nil) == (result.AskHuman == nil) {
-		return nil, fmt.Errorf("ToolResult must set exactly one of Result and AskHuman")
-	}
-	return result, nil
+	return &toolExecutor{tools: byName}
 }
 
-// toolRun is one finished tool call.
-type toolRun struct {
-	call   *types.MessageToolCall
-	result any
-	err    error
-	// resumed marks a call resuming an answered human request, where asking
-	// for a human again is a bug.
-	resumed bool
+type toolExecutor struct {
+	tools map[string]*Tool
 }
 
-func createToolResultMessage(
-	call *types.MessageToolCall,
-	result any,
-	resultErr error,
-	instructions map[string]string,
-	final bool,
-) (*types.MessageToolResult, error) {
-	resultString := ""
-	if result != nil {
-		if value, ok := result.(string); ok {
-			resultString = value
-		} else {
-			value, err := sonic.MarshalString(result)
-			if err != nil {
-				return nil, err
+func (x *toolExecutor) Can(e *Effect) bool {
+	if e == nil || e.CallTool == nil {
+		return false
+	}
+	if e.CallTool.Ask != nil && e.CallTool.Answer == nil {
+		return false
+	}
+	_, ok := x.tools[e.CallTool.Call.Name]
+	return ok
+}
+
+func (x *toolExecutor) Exec(ctx context.Context, s *State, e *Effect) (events []*Event, err error) {
+	call := e.CallTool.Call
+	tool := x.tools[call.Name]
+	tctx := &toolContext{Context: ctx, call: call, answer: e.CallTool.Answer, state: s}
+	var value any
+	func() {
+		// A panic anywhere in the tool answers the call instead of taking
+		// the process down.
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				err = fmt.Errorf("tool %s panic: %v", call.Name, recovered)
 			}
-			resultString = value
-		}
-	}
-
-	errorString := ""
-	if resultErr != nil {
-		errorString = resultErr.Error()
-	}
-
-	var instruction map[string][]string
-	if len(instructions) > 0 {
-		instruction = make(map[string][]string, len(instructions))
-		for key, value := range instructions {
-			instruction[key] = []string{value}
-		}
-	}
-
-	return &types.MessageToolResult{
-		ID:          call.ID,
-		Name:        call.Name,
-		Result:      resultString,
-		Error:       errorString,
-		Instruction: instruction,
-		Final:       final,
-	}, nil
+		}()
+		value, err = tool.Invoker(tctx, call.Arguments)
+	}()
+	return ToolOutcome(call, value, err, e.CallTool.Answer != nil)
 }
 
-// errToolInterrupted answers every tool call an interruption cut short or
-// never started.
-var errToolInterrupted = errors.New(
-	"tool call interrupted: it may not have run, or may have partly taken effect",
-)
-
-// runTools runs tool calls concurrently, each with its own context, and
-// appends what they produced through ctx: their human requests, then one tool
-// message holding every result in call order.
-//
-// Once ctx is canceled no tool starts, and every call not finished yet gets
-// errToolInterrupted as its result, so the stream never keeps a tool call
-// without an answer. The cancellation is returned once those results are
-// appended.
-func (a *Agent) runTools(ctx TurnContext, calls []*toolContext) error {
-	type finished struct {
-		index int
-		run   *toolRun
-	}
-	runs := make([]*toolRun, len(calls))
-	canceled := contextError(ctx)
-	if canceled == nil {
-		finishedCh := make(chan finished, len(calls))
-		for index, call := range calls {
-			go func() {
-				run := &toolRun{call: call.requested, resumed: call.response != nil}
-				// A panic anywhere in the handler chain answers the call
-				// instead of taking the process down.
-				defer func() {
-					if recovered := recover(); recovered != nil {
-						run.result = nil
-						run.err = fmt.Errorf("tool %s panic: %v", call.requested.Name, recovered)
-					}
-					finishedCh <- finished{index, run}
-				}()
-				run.result, run.err = a.toolCallHandler(call)
-			}()
-		}
-		for pending := len(calls); pending > 0 && canceled == nil; pending-- {
-			select {
-			case <-ctx.Done():
-				canceled = contextError(ctx)
-			case done := <-finishedCh:
-				runs[done.index] = done.run
+// ToolOutcome turns what a tool returned into the event recording it: a
+// ToolAsk when it asked, a ToolResult otherwise. A tool that errs answers
+// with the error, whatever it asked. A tool that asks again after it was
+// answered is a bug.
+func ToolOutcome(call ToolCall, value any, err error, answered bool) ([]*Event, error) {
+	if err == nil {
+		if ask, ok := value.(*Ask); ok && ask != nil {
+			if answered {
+				return nil, fmt.Errorf("tool %q asked again after it was answered", call.Name)
 			}
+			return []*Event{NewToolAskEvent(&ToolAsk{CallID: call.ID, Args: ask.Args})}, nil
 		}
-		// A tool that finished while the cancellation was noticed keeps its
-		// result: it ran, so the model must see what it did. One that only
-		// reported the cancellation was cut short like the others.
-		for drained := false; !drained; {
-			select {
-			case done := <-finishedCh:
-				if errors.Is(done.run.err, context.Canceled) ||
-					errors.Is(done.run.err, context.DeadlineExceeded) {
-					done.run.result, done.run.err = nil, errToolInterrupted
+	}
+	result := &ToolResult{CallID: call.ID, Name: call.Name}
+	var events []*Event
+	if err != nil {
+		result.Error = err.Error()
+	} else {
+		output, ok := value.(*Output)
+		if !ok {
+			output = &Output{Value: value}
+		}
+		if len(output.Patch) > 0 {
+			events = append(events, NewPatchEvent(output.Patch, false))
+		}
+		result.Instruction = output.Instruction
+		result.Final = output.Final
+		if output.Value != nil {
+			if text, ok := output.Value.(string); ok {
+				result.Value = text
+			} else {
+				text, err := sonic.MarshalString(output.Value)
+				if err != nil {
+					return nil, err
 				}
-				runs[done.index] = done.run
-			default:
-				drained = true
+				result.Value = text
 			}
 		}
 	}
-	for index, run := range runs {
-		if run == nil {
-			runs[index] = &toolRun{call: calls[index].requested, err: errToolInterrupted}
-		}
-	}
-
-	events, err := toolRunEvents(runs)
-	if err != nil {
-		return err
-	}
-	if err := ctx.Append(events...); err != nil {
-		return err
-	}
-	return canceled
+	return append(events, NewToolResultEvent(result)), nil
 }
 
-// callTool is the innermost tool call handler: it invokes the registered tool.
-func (a *Agent) callTool(ctx ToolContext) (any, error) {
-	call := ctx.ToolCall()
-	tool, err := a.getTool(call.Name)
-	if err != nil {
-		return nil, err
-	}
-	return tool.Invoker(ctx, call.Arguments)
+type toolContext struct {
+	context.Context
+	call   ToolCall
+	answer *ToolAnswer
+	state  *State
 }
 
-func (a *Agent) getTool(name string) (*Tool, error) {
-	for _, tool := range a.options.Tools {
-		if tool.Name == name {
-			return tool, nil
-		}
-	}
-	return nil, fmt.Errorf("tool %s not found", name)
-}
+func (c *toolContext) Call() ToolCall           { return c.call }
+func (c *toolContext) Answer() *ToolAnswer      { return c.answer }
+func (c *toolContext) State() map[string]string { return c.state.KV }
+func (c *toolContext) Events() []*Event         { return c.state.Events }
 
-// toolRunEvents turns one batch of tool runs into the events it appends: human
-// requests first, then one tool message holding every tool result of the batch
-// in call order.
-func toolRunEvents(runs []*toolRun) ([]*Event, error) {
-	events := make([]*Event, 0, len(runs)+1)
-	message := types.NewMessage(types.MessageRoleTool)
-	for _, run := range runs {
-		if run == nil || run.call == nil {
-			return nil, fmt.Errorf("invalid tool run")
-		}
-		result, err := asToolResult(run.result)
-		if err != nil {
-			return nil, fmt.Errorf("tool %q returned %w", run.call.Name, err)
-		}
-		// A failed call answers with its error, whatever it asked alongside.
-		if run.err != nil && result.AskHuman != nil {
-			result = &ToolResult{Result: &ToolOutput{}}
-		}
-		if run.resumed && result.AskHuman != nil {
-			return nil, fmt.Errorf("resumed human tool %q requested human input again", run.call.Name)
-		}
-		switch {
-		case result.AskHuman != nil:
-			events = append(events, NewEventHumanRequest(&EventHumanRequest{
-				ID:        uuid.NewString(),
-				Arguments: cloneAnyMap(result.AskHuman.Arguments),
-				ToolCall:  cloneToolCall(run.call),
-			}))
-		default:
-			toolResult, err := createToolResultMessage(
-				run.call,
-				result.Result.Value,
-				run.err,
-				result.Result.Instruction,
-				result.Result.Final,
-			)
+// HumanExecutor answers the questions tools ask. answer is called with the
+// call and its question and returns the answer; it may block on a human.
+func HumanExecutor(answer func(ctx context.Context, call ToolCall, ask *ToolAsk) (map[string]any, error)) Executor {
+	return ExecutorFunc{
+		CanFunc: func(e *Effect) bool {
+			return e != nil && e.CallTool != nil && e.CallTool.Ask != nil && e.CallTool.Answer == nil
+		},
+		ExecFunc: func(ctx context.Context, _ *State, e *Effect) ([]*Event, error) {
+			result, err := answer(ctx, e.CallTool.Call, e.CallTool.Ask)
 			if err != nil {
 				return nil, err
 			}
-			message.Parts = append(message.Parts, &types.MessagePart{ToolResult: toolResult})
-		}
+			return []*Event{NewToolAnswerEvent(&ToolAnswer{CallID: e.CallTool.Call.ID, Result: result})}, nil
+		},
 	}
-
-	if len(message.Parts) > 0 {
-		events = append(events, NewEventMessage(message))
-	}
-	return events, nil
-}
-
-func cloneToolCall(call *types.MessageToolCall) *types.MessageToolCall {
-	if call == nil {
-		return nil
-	}
-	clone := *call
-	return &clone
 }

@@ -5,263 +5,111 @@ import (
 	"errors"
 	"fmt"
 	"sync"
-
-	"github.com/xucx/llmx/types"
+	"time"
 )
 
-// session keeps the event stream of an agent, its single source of truth. It
-// derives, incrementally as events are appended, what keeps the stream
-// consistent: the state and the correlation of tool calls, human requests and
-// human responses. The model history is derived only when a turn needs it.
-// Appends are safe for concurrent use.
-//
-// Streaming fragments (delta messages) are written to the sink as they arrive
-// but never kept: the complete message follows them, so they carry nothing
-// the stream needs.
-//
-// Appended events and their nested values are immutable; the event sink and
-// every reader share them by reference.
-type session struct {
-	mu   sync.Mutex
-	sink EventSink
-	// sinkCtx is the context events are written to the sink with. It outlives
-	// task cancellation, so a canceled task can still close its turn.
-	sinkCtx context.Context
+// ErrConflict is returned by Session.Append when an event ID already exists,
+// or when expectSeq is set and does not match: another driver appended the
+// same outcome, or appended first. The caller reloads and plans again.
+var ErrConflict = errors.New("session conflict")
 
-	events         []*Event
-	ids            map[string]struct{}
-	state          map[string]string
-	toolCalls      map[string]*types.MessageToolCall
-	toolResults    map[string]*types.MessageToolResult
-	humanRequests  map[string]*EventHumanRequest
-	humanResponses map[string]*EventHumanResponse
-	// unresolved holds, in order, the human responses whose tool call has no
-	// result yet: answers that arrived but whose tool never resumed.
-	unresolved []*EventHumanResponse
+// Session is the event log of one conversation: the single source of truth.
+// Implementations decide where it lives (memory, a database, a remote
+// service) and must be safe for concurrent use by several drivers.
+type Session interface {
+	// Load returns every event in order and the seq of the last one (zero
+	// when empty).
+	Load(ctx context.Context) ([]*Event, int64, error)
+	// Append adds events in order as one batch, assigning Seq and At. A
+	// negative expectSeq skips the seq check; otherwise the batch is rejected
+	// with ErrConflict unless the session currently ends at expectSeq. A
+	// batch holding an ID already in the session is rejected as a whole with
+	// ErrConflict.
+	Append(ctx context.Context, expectSeq int64, events ...*Event) error
+	// Tail returns a channel that is closed once an event is appended after
+	// this call, so a driver can wait for new events.
+	Tail(ctx context.Context) <-chan struct{}
 }
 
-// newSession restores a session from history. Historical events are retained by
-// reference and never written to the sink again.
-func newSession(history []*Event, sink EventSink) (*session, error) {
-	s := &session{
-		sink:           sink,
-		sinkCtx:        context.Background(),
-		ids:            map[string]struct{}{},
-		state:          map[string]string{},
-		toolCalls:      map[string]*types.MessageToolCall{},
-		toolResults:    map[string]*types.MessageToolResult{},
-		humanRequests:  map[string]*EventHumanRequest{},
-		humanResponses: map[string]*EventHumanResponse{},
-	}
-	for _, event := range history {
-		if isDelta(event) {
-			continue
-		}
-		if err := s.admit(event); err != nil {
-			return nil, err
-		}
-		s.apply(event)
-	}
-	return s, nil
+// MemorySession keeps the events in memory. It backs Local and tests.
+type MemorySession struct {
+	mu      sync.Mutex
+	events  []*Event
+	ids     map[string]struct{}
+	changed chan struct{}
 }
 
-// errRejected wraps the error of an event the stream refused, as opposed to one
-// the sink could not persist.
-var errRejected = errors.New("event rejected")
+func NewMemorySession(events ...*Event) *MemorySession {
+	s := &MemorySession{ids: map[string]struct{}{}, changed: make(chan struct{})}
+	// Restored events without a seq are numbered in order.
+	var seq int64
+	for _, event := range events {
+		clone := event.Clone()
+		if clone.Seq <= seq {
+			seq++
+			clone.Seq = seq
+		} else {
+			seq = clone.Seq
+		}
+		s.events = append(s.events, clone)
+		s.ids[clone.ID] = struct{}{}
+	}
+	return s
+}
 
-// append appends events in order, as one batch. Every event is checked against
-// the stream and against the events before it in the batch before any is
-// written, so a rejected batch leaves no trace. Each event is then written to
-// the sink and applied: the sink is write-ahead, so an event the caller could
-// not persist never reaches the stream. A streaming fragment is only checked
-// and written to the sink.
-func (s *session) append(events ...*Event) error {
+func (s *MemorySession) Load(context.Context) ([]*Event, int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	events := make([]*Event, len(s.events))
+	copy(events, s.events)
+	return events, s.seqLocked(), nil
+}
+
+func (s *MemorySession) seqLocked() int64 {
+	if len(s.events) == 0 {
+		return 0
+	}
+	return s.events[len(s.events)-1].Seq
+}
+
+func (s *MemorySession) Append(_ context.Context, expectSeq int64, events ...*Event) error {
+	if len(events) == 0 {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if expectSeq >= 0 && s.seqLocked() != expectSeq {
+		return fmt.Errorf("%w: expected seq %d, have %d", ErrConflict, expectSeq, s.seqLocked())
+	}
 	batch := map[string]struct{}{}
 	for _, event := range events {
-		if isDelta(event) {
-			if err := event.Validate(); err != nil {
-				return fmt.Errorf("%w: %w", errRejected, err)
-			}
-			continue
+		if err := event.Validate(); err != nil {
+			return err
 		}
-		if err := s.admit(event); err != nil {
-			return fmt.Errorf("%w: %w", errRejected, err)
+		if _, exists := s.ids[event.ID]; exists {
+			return fmt.Errorf("%w: event %q exists", ErrConflict, event.ID)
 		}
-		// admit only checks these against the stream, not within the batch.
-		keys := []string{"event id " + event.ID}
-		switch {
-		case event.HumanRequest != nil:
-			keys = append(keys, "human request id "+event.HumanRequest.ID)
-		case event.HumanResponse != nil:
-			keys = append(keys, "human response for request "+event.HumanResponse.ID)
+		if _, dup := batch[event.ID]; dup {
+			return fmt.Errorf("%w: event %q twice in one batch", ErrConflict, event.ID)
 		}
-		for _, key := range keys {
-			if _, dup := batch[key]; dup {
-				return fmt.Errorf("%w: duplicate %s in one batch", errRejected, key)
-			}
-			batch[key] = struct{}{}
-		}
+		batch[event.ID] = struct{}{}
 	}
+	seq := s.seqLocked()
+	now := time.Now().UnixMilli()
 	for _, event := range events {
-		if s.sink != nil {
-			if err := s.sink(s.sinkCtx, event); err != nil {
-				return fmt.Errorf("event sink fail %w", err)
-			}
-		}
-		if !isDelta(event) {
-			s.apply(event)
-		}
+		seq++
+		clone := event.Clone()
+		clone.Seq, clone.At = seq, now
+		s.events = append(s.events, clone)
+		s.ids[clone.ID] = struct{}{}
 	}
+	close(s.changed)
+	s.changed = make(chan struct{})
 	return nil
 }
 
-// admit checks that an event is valid and consistent with the stream, without
-// changing anything.
-func (s *session) admit(event *Event) error {
-	if err := event.Validate(); err != nil {
-		return fmt.Errorf("event validate fail %w", err)
-	}
-	if _, exists := s.ids[event.ID]; exists {
-		return fmt.Errorf("duplicate event id %q", event.ID)
-	}
-	switch {
-	case event.HumanRequest != nil:
-		request := event.HumanRequest
-		call, exists := s.toolCalls[request.ToolCall.ID]
-		if !exists {
-			return fmt.Errorf("human request references unknown tool call %q", request.ToolCall.ID)
-		}
-		if call.Name != request.ToolCall.Name {
-			return fmt.Errorf("human request tool call %q name mismatch", request.ToolCall.ID)
-		}
-		if _, exists := s.humanRequests[request.ID]; exists {
-			return fmt.Errorf("duplicate human request id %q", request.ID)
-		}
-	case event.HumanResponse != nil:
-		response := event.HumanResponse
-		request, exists := s.humanRequests[response.ID]
-		if !exists {
-			return fmt.Errorf("human response references unknown request %q", response.ID)
-		}
-		if _, resolved := s.toolResults[request.ToolCall.ID]; resolved {
-			return fmt.Errorf("human response references resolved request %q", response.ID)
-		}
-		if _, exists := s.humanResponses[response.ID]; exists {
-			return fmt.Errorf("duplicate human response for request %q", response.ID)
-		}
-	}
-	return nil
-}
-
-// apply adds an admitted event to the stream and everything derived from it.
-func (s *session) apply(event *Event) {
-	switch {
-	case event.Message != nil:
-		for _, part := range event.Message.Parts {
-			if part == nil {
-				continue
-			}
-			if part.ToolCall != nil && part.ToolCall.ID != "" {
-				s.toolCalls[part.ToolCall.ID] = part.ToolCall
-			}
-			if part.ToolResult != nil && part.ToolResult.ID != "" {
-				s.toolResults[part.ToolResult.ID] = part.ToolResult
-				s.resolve(part.ToolResult.ID)
-			}
-		}
-	case event.HumanRequest != nil:
-		s.humanRequests[event.HumanRequest.ID] = event.HumanRequest
-	case event.HumanResponse != nil:
-		s.humanResponses[event.HumanResponse.ID] = event.HumanResponse
-		s.unresolved = append(s.unresolved, event.HumanResponse)
-	case event.State != nil:
-		if !event.State.Patch {
-			s.state = map[string]string{}
-		}
-		for key, value := range event.State.State {
-			s.state[key] = value
-		}
-	}
-	s.events = append(s.events, event)
-	s.ids[event.ID] = struct{}{}
-}
-
-func isDelta(event *Event) bool {
-	return event != nil && event.Message != nil && event.Message.Delta
-}
-
-func (s *session) setSinkContext(ctx context.Context) {
-	s.mu.Lock()
-	s.sinkCtx = context.WithoutCancel(ctx)
-	s.mu.Unlock()
-}
-
-func (s *session) len() int {
+func (s *MemorySession) Tail(context.Context) <-chan struct{} {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return len(s.events)
-}
-
-// eventsFrom returns the events appended at or after index.
-func (s *session) eventsFrom(index int) []*Event {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return append([]*Event(nil), s.events[index:]...)
-}
-
-func (s *session) allEvents() []*Event {
-	return s.eventsFrom(0)
-}
-
-// history returns the model history the stream describes: its messages, in
-// order.
-func (s *session) history() []*types.Message {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	var messages []*types.Message
-	for _, event := range s.events {
-		if event.Message != nil {
-			messages = append(messages, event.Message)
-		}
-	}
-	return messages
-}
-
-func (s *session) stateSnapshot() map[string]string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return cloneStringMap(s.state)
-}
-
-func (s *session) humanRequest(id string) *EventHumanRequest {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.humanRequests[id]
-}
-
-func (s *session) resolved(callID string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	_, resolved := s.toolResults[callID]
-	return resolved
-}
-
-// resolve drops the unresolved response whose tool call just got a result.
-func (s *session) resolve(callID string) {
-	for index, response := range s.unresolved {
-		if s.humanRequests[response.ID].ToolCall.ID == callID {
-			s.unresolved = append(s.unresolved[:index:index], s.unresolved[index+1:]...)
-			return
-		}
-	}
-}
-
-// unresolvedResponses returns, in order, the human responses whose tool call
-// has no result yet.
-func (s *session) unresolvedResponses() []*EventHumanResponse {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return append([]*EventHumanResponse(nil), s.unresolved...)
+	return s.changed
 }

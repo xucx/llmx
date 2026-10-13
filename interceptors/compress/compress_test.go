@@ -3,6 +3,7 @@ package compress
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strconv"
 	"strings"
 	"sync"
@@ -32,22 +33,6 @@ func fixedCompletion(completion *types.Completion) func([]*types.Message) *types
 	return func([]*types.Message) *types.Completion { return completion }
 }
 
-// agentFactory builds agents sharing one configuration, each over its own
-// event stream.
-type agentFactory func(events []*llmx.Event) *llmx.Agent
-
-func newAgentFactory(t *testing.T, models *llmx.Models, opts ...llmx.AgentOption) agentFactory {
-	return func(events []*llmx.Event) *llmx.Agent {
-		t.Helper()
-		agent, err := llmx.NewAgent("test", "", models, events,
-			append([]llmx.AgentOption{llmx.WithModel("fake")}, opts...)...)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return agent
-	}
-}
-
 // newTestModels registers one model "fake" with a 100 token window.
 func newTestModels(
 	t *testing.T,
@@ -69,28 +54,55 @@ func newTestModels(
 	return models
 }
 
+// errModelStopped reports a round stopped by a failed model call.
+var errModelStopped = errors.New("model call failed")
+
+// runAgent drives one input over a session restored from events, with the
+// model wrapped by interceptors, and returns the events appended since.
+func runAgent(
+	t *testing.T,
+	models *llmx.Models,
+	events []*llmx.Event,
+	text string,
+	tools []*llmx.Tool,
+	interceptors ...llmx.Interceptor,
+) ([]*llmx.Event, error) {
+	t.Helper()
+	agent := &llmx.Agent{Model: "fake", MaxTurn: 16}
+	local, err := llmx.NewLocal(agent, []llmx.Executor{
+		llmx.ModelExecutor(models, llmx.WithInterceptors(interceptors...)),
+		llmx.ToolExecutor(tools...),
+	}, events...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer local.Close()
+	since, err := local.Run(t.Context(), llmx.NewUserInput(llmx.InputQueue, text))
+	if err != nil {
+		return since, err
+	}
+	for _, event := range since {
+		if event.Stop != nil && event.Stop.Reason == llmx.StopError {
+			return since, errModelStopped
+		}
+	}
+	return since, nil
+}
+
 // longToolHistory is a tool call and its long result, followed by a usage that
-// fills the whole context window.
+// fills the whole context window. The result is final, so the restored
+// session is idle until an input arrives.
 func longToolHistory() []*llmx.Event {
-	toolCall := types.NewMessage(types.MessageRoleAssistant)
-	toolCall.Parts = append(toolCall.Parts, &types.MessagePart{
-		ToolCall: &types.MessageToolCall{
-			ID: "call", Name: "long_tool", Arguments: "{}",
-		},
-	})
-	toolResult := types.NewToolResultMessage(
-		"call",
-		"long_tool",
-		"a very long tool result that should be omitted",
-		"",
-	)
 	return []*llmx.Event{
-		llmx.NewEventMessage(toolCall),
-		llmx.NewEventMessage(toolResult),
-		llmx.NewEventUsage(types.CompletionUsage{
-			PromptTokens: 100,
-			TotalTokens:  100,
+		llmx.NewReplyEvent(&llmx.Reply{
+			ToolCalls: []llmx.ToolCall{{ID: "call", Name: "long_tool", Arguments: "{}"}},
 		}),
+		llmx.NewToolResultEvent(&llmx.ToolResult{
+			CallID: "call", Name: "long_tool",
+			Value: "a very long tool result that should be omitted",
+			Final: true,
+		}),
+		llmx.NewUsageEvent(0, "fake", types.CompletionUsage{PromptTokens: 100, TotalTokens: 100}),
 	}
 }
 
@@ -122,15 +134,15 @@ var omitOptions = Options{
 	ToolResultReplace: "omitted",
 }
 
-// recordedCompressions returns the compressions recorded by state events.
+// recordedCompressions returns the compressions recorded by patch events.
 func recordedCompressions(t *testing.T, events []*llmx.Event) []*compression {
 	t.Helper()
 	var compressions []*compression
 	for _, event := range events {
-		if event.State == nil {
+		if event.Patch == nil {
 			continue
 		}
-		for key, value := range event.State.State {
+		for key, value := range event.Patch.KV {
 			if !strings.HasPrefix(key, compressionStatePrefix) {
 				continue
 			}
@@ -145,16 +157,24 @@ func recordedCompressions(t *testing.T, events []*llmx.Event) []*compression {
 }
 
 // rawHistory records the tool results of the messages it is handed.
-type rawHistory struct {
-	llmx.NopInterceptor
-	seen *[]string
+func rawHistory(seen *[]string) llmx.Interceptor {
+	return llmx.InterceptorFunc(func(next llmx.ModelHandler) llmx.ModelHandler {
+		return func(ctx llmx.ModelContext) (*types.Completion, error) {
+			*seen = toolResultsOf(ctx.Request().Messages)
+			return next(ctx)
+		}
+	})
 }
 
-func (r rawHistory) InterceptLLM(next llmx.LLMHandler) llmx.LLMHandler {
-	return func(ctx llmx.LLMContext) (*types.Completion, error) {
-		*r.seen = toolResultsOf(ctx.Request().Messages)
-		return next(ctx)
+func record(t *testing.T, index int, recorded *compression) *llmx.Event {
+	t.Helper()
+	data, err := json.Marshal(recorded)
+	if err != nil {
+		t.Fatal(err)
 	}
+	return llmx.NewPatchEvent(map[string]string{
+		compressionStatePrefix + strconv.Itoa(index): string(data),
+	}, false)
 }
 
 func TestCompressRecordsBeforeTheModelCall(t *testing.T) {
@@ -165,33 +185,26 @@ func TestCompressRecordsBeforeTheModelCall(t *testing.T) {
 			Message: types.NewTextMessage(types.MessageRoleAssistant, "done"),
 		}
 	})
-	agent := newAgentFactory(t, models,
-		llmx.WithInterceptor(rawHistory{seen: &raw}, New(models, omitOptions)),
-	)
 
-	session := agent(longToolHistory())
-	result, err := session.Run(context.Background(), llmx.NewUserInput("latest"))
+	since, err := runAgent(t, models, longToolHistory(), "latest", nil, rawHistory(&raw), New(models, omitOptions))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(seen) != 1 || seen[0] != "omitted" {
 		t.Fatalf("compressed history was not sent to the model: %+v", seen)
 	}
-	// running, user input, the recorded compression, then the completion.
-	if len(result.Events) < 4 ||
-		result.Events[1].Message == nil ||
-		result.Events[2].State == nil ||
-		result.Events[3].Message == nil {
-		t.Fatalf("compression was not recorded before the completion: %+v", result.Events)
+	// user input, the recorded compression, then the reply.
+	if len(since) < 3 || since[0].Input == nil || since[1].Patch == nil || since[2].Reply == nil {
+		t.Fatalf("compression was not recorded before the reply: %+v", since)
 	}
-	compressions := recordedCompressions(t, result.Events[2:3])
+	compressions := recordedCompressions(t, since[1:2])
 	if len(compressions) != 1 ||
 		compressions[0].ToolResult == nil ||
 		compressions[0].ToolResult.Result != "omitted" {
 		t.Fatalf("unexpected recorded compression: %+v", compressions)
 	}
-	// The event stream itself stays whole: an LLM interceptor registered
-	// before compress still sees the original tool result.
+	// The session itself stays whole: an interceptor registered before
+	// compress still sees the original tool result.
 	if len(raw) != 1 || raw[0] == "omitted" {
 		t.Fatalf("session history was compressed: %+v", raw)
 	}
@@ -208,31 +221,24 @@ func TestCompressionReplaysFromTheEventLog(t *testing.T) {
 			Message: types.NewTextMessage(types.MessageRoleAssistant, "done"),
 		}
 	})
-	agent := newAgentFactory(t, models,
-		llmx.WithInterceptor(New(models, omitOptions)),
-	)
 
-	initialHistory := longToolHistory()
-	firstSession := agent(initialHistory)
-	first, err := firstSession.Run(context.Background(), llmx.NewUserInput("first"))
+	history := longToolHistory()
+	first, err := runAgent(t, models, history, "first", nil, New(models, omitOptions))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := len(recordedCompressions(t, first.Events)); got != 1 {
+	if got := len(recordedCompressions(t, first)); got != 1 {
 		t.Fatalf("first run recorded %d compressions, want 1", got)
 	}
 
-	stored := append([]*llmx.Event(nil), initialHistory...)
-	stored = append(stored, first.Events...)
-	secondSession := agent(stored)
-	second, err := secondSession.Run(context.Background(), llmx.NewUserInput("second"))
+	stored := append(append([]*llmx.Event(nil), history...), first...)
+	second, err := runAgent(t, models, stored, "second", nil, New(models, omitOptions))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := len(recordedCompressions(t, second.Events)); got != 0 {
+	if got := len(recordedCompressions(t, second)); got != 0 {
 		t.Fatalf("restored history was compressed again: %d", got)
 	}
-
 	mu.Lock()
 	defer mu.Unlock()
 	if len(seen) != 2 ||
@@ -256,51 +262,39 @@ func TestReplayAppliesToolResultCompressionsReachingPastTheSummary(t *testing.T)
 		}
 	})
 
-	old := types.NewTextMessage(types.MessageRoleUser, "old")
-	toolCall := types.NewMessage(types.MessageRoleAssistant)
-	toolCall.Parts = append(toolCall.Parts, &types.MessagePart{
-		ToolCall: &types.MessageToolCall{ID: "call", Name: "long_tool", Arguments: "{}"},
+	old := llmx.NewInputEvent(llmx.NewUserInput(llmx.InputQueue, "old"))
+	// The reply was made from seq 1, after the old input.
+	toolCall := llmx.NewReplyEvent(&llmx.Reply{
+		BaseSeq:   1,
+		ToolCalls: []llmx.ToolCall{{ID: "call", Name: "long_tool", Arguments: "{}"}},
 	})
-	toolResult := types.NewToolResultMessage(
-		"call",
-		"long_tool",
-		"a very long tool result that should be omitted",
-		"",
-	)
-	record := func(index int, recorded *compression) *llmx.Event {
-		data, err := json.Marshal(recorded)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return llmx.NewEventState(map[string]string{
-			compressionStatePrefix + strconv.Itoa(index): string(data),
-		}, true)
-	}
+	toolResult := llmx.NewToolResultEvent(&llmx.ToolResult{
+		CallID: "call", Name: "long_tool",
+		Value: "a very long tool result that should be omitted",
+		Final: true,
+	})
 	// Both compressions were decided on the reported size, so none is
 	// generated: the model sees the replay alone.
 	history := []*llmx.Event{
-		llmx.NewEventMessage(old),
-		llmx.NewEventMessage(toolCall),
-		llmx.NewEventMessage(toolResult),
-		record(0, &compression{
+		old, toolCall, toolResult,
+		record(t, 0, &compression{
 			ToolResult:     &toolResultCompression{Result: "omitted"},
 			UntilMessageID: toolResult.ID,
 			Tokens:         100,
 		}),
-		record(1, &compression{
+		record(t, 1, &compression{
 			Summary:        types.NewTextMessage(types.MessageRoleUser, "bridge"),
 			UntilMessageID: old.ID,
 			Tokens:         100,
 		}),
-		llmx.NewEventUsage(types.CompletionUsage{PromptTokens: 100, TotalTokens: 100}),
+		llmx.NewUsageEvent(0, "fake", types.CompletionUsage{PromptTokens: 100, TotalTokens: 100}),
 	}
 
-	agent := newAgentFactory(t, models, llmx.WithInterceptor(New(models, omitOptions)))
-	result, err := agent(history).Run(context.Background(), llmx.NewUserInput("latest"))
+	since, err := runAgent(t, models, history, "latest", nil, New(models, omitOptions))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := len(recordedCompressions(t, result.Events)); got != 0 {
+	if got := len(recordedCompressions(t, since)); got != 0 {
 		t.Fatalf("replay generated %d compressions, want 0", got)
 	}
 	mu.Lock()
@@ -326,28 +320,25 @@ func TestCompressionSurvivesAFailedModelCall(t *testing.T) {
 	})
 	withSummary := omitOptions
 	withSummary.SummaryLevel = 0.5
-	agent := newAgentFactory(t, models, llmx.WithInterceptor(New(models, omitOptions)))
-	rebuilt := newAgentFactory(t, models, llmx.WithInterceptor(New(models, withSummary)))
 
 	history := longToolHistory()
-	first, err := agent(history).Run(context.Background(), llmx.NewUserInput("latest"))
+	first, err := runAgent(t, models, history, "latest", nil, New(models, omitOptions))
 	if err == nil {
 		t.Fatal("the failed model call was not reported")
 	}
-	if got := len(recordedCompressions(t, first.Events)); got != 1 {
+	if got := len(recordedCompressions(t, first)); got != 1 {
 		t.Fatalf("the compression was not recorded before the model call: %d", got)
 	}
 
-	// Rebuilt from what was appended, the agent replays the compression. No
-	// model call reported a size since, so it does not compress again -- the
-	// summary level would otherwise trigger on the stale size.
+	// Restored from what was appended, the session replays the compression.
+	// No model call reported a size since, so it does not compress again --
+	// the summary level would otherwise trigger on the stale size.
 	fail = false
-	second, err := rebuilt(append(history, first.Events...)).
-		Run(context.Background(), llmx.NewUserInput("again"))
+	second, err := runAgent(t, models, append(history, first...), "again", nil, New(models, withSummary))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := len(recordedCompressions(t, second.Events)); got != 0 || calls != 2 {
+	if got := len(recordedCompressions(t, second)); got != 0 || calls != 2 {
 		t.Fatalf("compressed again on a stale size: compressions=%d calls=%d", got, calls)
 	}
 	if len(seen) != 1 || seen[0] != "omitted" {
@@ -357,15 +348,15 @@ func TestCompressionSurvivesAFailedModelCall(t *testing.T) {
 
 func TestContextTokensIsTheNewestUsage(t *testing.T) {
 	events := []*llmx.Event{
-		llmx.NewEventUsage(types.CompletionUsage{TotalTokens: 100}),
-		llmx.NewEventMessage(latestInput()),
-		llmx.NewEventUsage(types.CompletionUsage{TotalTokens: 150}),
+		llmx.NewUsageEvent(1, "fake", types.CompletionUsage{TotalTokens: 10}),
+		llmx.NewInputEvent(llmx.NewUserInput(llmx.InputQueue, "hi")),
+		llmx.NewUsageEvent(2, "fake", types.CompletionUsage{TotalTokens: 20}),
 	}
-	// A completion reports the whole context it consumed: 150, not 100 + 150.
-	if got := contextTokens(events); got != 150 {
-		t.Fatalf("context tokens = %d, want 150", got)
+	if got := contextTokens(events); got != 20 {
+		t.Fatalf("contextTokens = %d, want 20", got)
 	}
 }
+
 func TestCompressReportsOneToolResultCompression(t *testing.T) {
 	models := newTestModels(t, nil)
 	toolResult := types.NewToolResultMessage(
@@ -639,11 +630,15 @@ func TestSummaryBridgeMarksAnInProgressRequest(t *testing.T) {
 
 type emptyParam struct{}
 
+
 func TestCompressShrinksALongRunStartedByOneRequest(t *testing.T) {
 	const steps = 4
+	var mu sync.Mutex
 	var calls int
 	var lastSeen []string
 	models := newTestModels(t, func(messages []*types.Message) *types.Completion {
+		mu.Lock()
+		defer mu.Unlock()
 		calls++
 		lastSeen = toolResultsOf(messages)
 		// Every call reports a context size above the level, a new one each
@@ -667,17 +662,14 @@ func TestCompressShrinksALongRunStartedByOneRequest(t *testing.T) {
 			return "a long tool result the run no longer needs", nil
 		},
 	)
-	agent := newAgentFactory(t, models,
-		llmx.WithTools(tool),
-		llmx.WithInterceptor(New(models, omitOptions)),
-	)
-	session := agent(nil)
-	if _, err := session.Run(context.Background(), llmx.NewUserInput("long task")); err != nil {
+	if _, err := runAgent(t, models, nil, "long task", []*llmx.Tool{tool}, New(models, omitOptions)); err != nil {
 		t.Fatal(err)
 	}
 
 	// The whole run is one user turn. Only the newest step is kept, every
 	// older tool result of that same turn is omitted.
+	mu.Lock()
+	defer mu.Unlock()
 	if calls != steps+1 || len(lastSeen) != steps {
 		t.Fatalf("unexpected run: calls=%d results=%v", calls, lastSeen)
 	}
@@ -712,6 +704,7 @@ func TestCompressFallsBackWhenAHigherCompressionShrinksNothing(t *testing.T) {
 	}
 }
 
+
 func TestFailedSummaryFallsBackAndDoesNotFailTheModelCall(t *testing.T) {
 	var seen []string
 	models := newTestModels(t, func(messages []*types.Message) *types.Completion {
@@ -725,13 +718,12 @@ func TestFailedSummaryFallsBackAndDoesNotFailTheModelCall(t *testing.T) {
 	})
 	options := omitOptions
 	options.SummaryLevel = 2
-	agent := newAgentFactory(t, models, llmx.WithInterceptor(New(models, options)))
 
-	result, err := agent(longToolHistory()).Run(context.Background(), llmx.NewUserInput("latest"))
+	since, err := runAgent(t, models, longToolHistory(), "latest", nil, New(models, options))
 	if err != nil {
 		t.Fatalf("a failed summary failed the model call: %v", err)
 	}
-	compressions := recordedCompressions(t, result.Events)
+	compressions := recordedCompressions(t, since)
 	if len(compressions) != 1 || compressions[0].ToolResult == nil {
 		t.Fatalf("did not fall back to the tool-result compression: %+v", compressions)
 	}
@@ -748,25 +740,18 @@ func TestBrokenCompressionDoesNotFailTheModelCall(t *testing.T) {
 			Message: types.NewTextMessage(types.MessageRoleAssistant, "done"),
 		}
 	})
-	agent := newAgentFactory(t, models, llmx.WithInterceptor(New(models, omitOptions)))
 
-	broken, err := json.Marshal(&compression{
+	history := append(longToolHistory(), record(t, 0, &compression{
 		ToolResult:     &toolResultCompression{Result: "omitted"},
 		UntilMessageID: "missing",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	history := append(longToolHistory(), llmx.NewEventState(map[string]string{
-		compressionStatePrefix + "0": string(broken),
-	}, true))
-	result, err := agent(history).Run(context.Background(), llmx.NewUserInput("latest"))
+	}))
+	since, err := runAgent(t, models, history, "latest", nil, New(models, omitOptions))
 	if err != nil {
 		t.Fatalf("a broken compression failed the model call: %v", err)
 	}
 	// Nothing is recorded after a compression that never replays, and the
 	// model gets the history uncompressed.
-	if got := len(recordedCompressions(t, result.Events)); got != 0 {
+	if got := len(recordedCompressions(t, since)); got != 0 {
 		t.Fatalf("compressed after a broken compression: %d", got)
 	}
 	if len(seen) != 1 || seen[0] == "omitted" {

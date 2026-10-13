@@ -32,15 +32,15 @@ type toolResultCompression struct {
 	Instructions map[string]string `json:"instructions,omitempty"`
 }
 
-// loadCompressions reads the compressions recorded by state events, in commit
+// loadCompressions reads the compressions recorded by patch events, in commit
 // order.
 func loadCompressions(events []*llmx.Event) ([]*compression, error) {
 	recorded := map[int]string{}
 	for _, event := range events {
-		if event == nil || event.State == nil {
+		if event == nil || event.Patch == nil {
 			continue
 		}
-		for key, value := range event.State.State {
+		for key, value := range event.Patch.KV {
 			suffix, found := strings.CutPrefix(key, compressionStatePrefix)
 			index, err := strconv.Atoi(suffix)
 			if !found || err != nil || index < 0 {
