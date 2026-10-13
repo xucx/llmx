@@ -89,8 +89,8 @@ type ToolCall struct {
 // Reply is everything one model call produced.
 type Reply struct {
 	// BaseSeq is the Session seq the call was made from: the messages sent
-	// to the model were built from the events up to it. Inputs appended after
-	// it and before the reply arrived during the turn (see Fold).
+	// to the model were built from the events up to it. It also makes the
+	// reply ID deterministic (see ReplyID).
 	BaseSeq   int64      `json:"baseSeq"`
 	Model     string     `json:"model,omitempty"`
 	Text      string     `json:"text,omitempty"`

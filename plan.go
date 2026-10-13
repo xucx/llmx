@@ -63,7 +63,7 @@ func Plan(s *State, a *Agent) []Effect {
 	if s == nil || a == nil {
 		return nil
 	}
-	if interrupt := s.FirstInput(InputInterrupt); interrupt != nil && s.Active() && s.hold[interrupt.ID] <= s.Seq {
+	if interrupt := s.FirstInput(InputInterrupt); interrupt != nil && s.Active() {
 		var events []*Event
 		for _, pending := range s.Pending {
 			events = append(events, NewToolResultEvent(&ToolResult{

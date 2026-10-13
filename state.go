@@ -42,9 +42,10 @@ type State struct {
 
 	calls    map[string]ToolCall
 	resolved map[string]struct{}
-	// hold maps an input event ID to the seq of the reply that was in flight
-	// when the input arrived: the input is not admitted before that reply.
-	hold map[string]int64
+	// held marks the inputs that arrived while the model was being asked:
+	// they wait for the reply (or stop) that was in flight, so the reply is
+	// never shown as an answer to them.
+	held map[string]struct{}
 }
 
 // Fold derives the State from events, which must be in seq order.
@@ -53,20 +54,7 @@ func Fold(events []*Event) *State {
 		KV:       map[string]string{},
 		calls:    map[string]ToolCall{},
 		resolved: map[string]struct{}{},
-		hold:     map[string]int64{},
-	}
-	// A reply covers the inputs appended while its model call was in flight.
-	for _, event := range events {
-		if event.Reply == nil {
-			continue
-		}
-		for _, input := range events {
-			if input.Input != nil && input.Seq > event.Reply.BaseSeq && input.Seq < event.Seq {
-				if held := s.hold[input.ID]; held < event.Seq {
-					s.hold[input.ID] = event.Seq
-				}
-			}
-		}
+		held:     map[string]struct{}{},
 	}
 	for _, event := range events {
 		s.apply(event)
@@ -83,7 +71,14 @@ func (s *State) apply(event *Event) {
 	switch {
 	case event.Input != nil:
 		s.Inputs = append(s.Inputs, event)
+		// The model is being asked (or about to be): an interjection or a
+		// queued input must not slip in before its reply lands, or the
+		// reply would read as an answer to the newcomer.
+		if event.Input.Mode != InputInterrupt && len(s.Pending) == 0 && s.NeedsAnswer() {
+			s.held[event.ID] = struct{}{}
+		}
 	case event.Reply != nil:
+		clear(s.held)
 		s.Admitted = append(s.Admitted, event)
 		s.Turns++
 		s.Pending = s.Pending[:0]
@@ -118,6 +113,7 @@ func (s *State) apply(event *Event) {
 	case event.Patch != nil:
 		s.patch(event.Patch.KV, event.Patch.Reset)
 	case event.Stop != nil:
+		clear(s.held)
 		s.Stopped = event.Stop
 	}
 	s.admit()
@@ -143,7 +139,7 @@ func (s *State) patch(kv map[string]string, reset bool) {
 // Admitted. The rules only depend on the events folded so far, so every
 // driver agrees:
 //
-//   - an input appended while a model call was in flight waits for its reply;
+//   - an input appended while the model was being asked waits for the reply;
 //   - an interrupt joins once nothing is active (Plan cancels what is first)
 //     and discards the inputs waiting before it;
 //   - an interjection joins once no tool call is pending, ahead of queued
@@ -154,7 +150,7 @@ func (s *State) admit() {
 		if len(s.Inputs) == 0 {
 			return
 		}
-		held := func(event *Event) bool { return s.hold[event.ID] > s.Seq }
+		held := func(event *Event) bool { _, ok := s.held[event.ID]; return ok }
 
 		if index := s.firstInput(InputInterrupt); index >= 0 && !held(s.Inputs[index]) {
 			if s.Active() {

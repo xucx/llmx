@@ -174,22 +174,29 @@ func TestQueuedInputWaitsUntilIdleAndInterjectionGoesFirst(t *testing.T) {
 		input("q3", InputInterject, "now"),
 	)
 	s := Fold(events)
-	// q1 joined when idle; q3 joins ahead of q2 since nothing is pending.
-	if len(s.Admitted) != 2 || s.Admitted[0].ID != "q1" || s.Admitted[1].ID != "q3" {
-		t.Fatalf("admitted = %+v", s.Admitted)
+	// q1 joined when idle; q2 and q3 arrived while q1 awaits its reply, so
+	// both wait for it.
+	if len(s.Admitted) != 1 || s.Admitted[0].ID != "q1" || len(s.Inputs) != 2 {
+		t.Fatalf("admitted = %v inputs = %v", eventIDs(s.Admitted), eventIDs(s.Inputs))
+	}
+	s = Fold(numbered(append(events, reply(3, "answer one"))...))
+	// Once the reply lands the interjection goes first; the queued input
+	// waits until that is answered too.
+	if last := s.Admitted[len(s.Admitted)-1]; last.ID != "q3" {
+		t.Fatalf("interjection not admitted first: %v", eventIDs(s.Admitted))
 	}
 	if len(s.Inputs) != 1 || s.Inputs[0].ID != "q2" {
-		t.Fatalf("queued input must wait: %+v", s.Inputs)
+		t.Fatalf("queued input must wait: %v", eventIDs(s.Inputs))
 	}
-	s = Fold(numbered(append(events, reply(3, "answer"))...))
+	s = Fold(numbered(append(events, reply(3, "answer one"), reply(5, "answer now"))...))
 	if last := s.Admitted[len(s.Admitted)-1]; last.ID != "q2" {
-		t.Fatalf("queued input not admitted once idle: %s", last.ID)
+		t.Fatalf("queued input not admitted once idle: %v", eventIDs(s.Admitted))
 	}
 }
 
 func TestInputDuringModelCallWaitsForTheReply(t *testing.T) {
-	// The reply at seq 3 was made from seq 1: the input at seq 2 arrived
-	// while the model was running and joins after the reply.
+	// The input at seq 2 arrived while the model was being asked about seq
+	// 1: it joins after the reply, never before it.
 	s := Fold(numbered(
 		input("q1", InputQueue, "first"),
 		input("q2", InputInterject, "while running"),
@@ -200,6 +207,17 @@ func TestInputDuringModelCallWaitsForTheReply(t *testing.T) {
 	}
 	if got := ids(Plan(s, testAgent)); len(got) != 1 || got[0] != ReplyID(3) {
 		t.Fatalf("effects = %v", got)
+	}
+	// Before the reply lands the newcomer is visibly waiting, not admitted.
+	live := Fold(numbered(
+		input("q1", InputQueue, "first"),
+		input("q2", InputInterject, "while running"),
+	))
+	if len(live.Admitted) != 1 || len(live.Inputs) != 1 || live.Inputs[0].ID != "q2" {
+		t.Fatalf("live admitted = %v inputs = %v", eventIDs(live.Admitted), eventIDs(live.Inputs))
+	}
+	if got := ids(Plan(live, testAgent)); len(got) != 1 || got[0] != ReplyID(2) {
+		t.Fatalf("live effects = %v", got)
 	}
 }
 
