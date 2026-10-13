@@ -77,6 +77,12 @@ type Input struct {
 	// Tools declares the tools the sender can run, visible to the model from
 	// this input on until another input declares tools.
 	Tools []ToolSpec `json:"tools,omitempty"`
+	// Model and ReasonLevel override the agent definition for the model calls
+	// from this input on, until another input sets them. Empty / nil keep the
+	// current values. They are the library's own settings, kept apart from
+	// the caller-defined State.
+	Model       string `json:"model,omitempty"`
+	ReasonLevel *int   `json:"reasonLevel,omitempty"`
 }
 
 // ToolCall is one call the model made.
@@ -280,6 +286,9 @@ func (i *Input) Validate() error {
 			return fmt.Errorf("input state key is empty")
 		}
 	}
+	if i.ReasonLevel != nil && (*i.ReasonLevel < 0 || *i.ReasonLevel > 10) {
+		return fmt.Errorf("input reason level %d out of range 0-10", *i.ReasonLevel)
+	}
 	names := map[string]struct{}{}
 	for index, tool := range i.Tools {
 		if tool.Name == "" {
@@ -349,6 +358,10 @@ func (i *Input) Clone() *Input {
 	clone.Content = append([]Content(nil), i.Content...)
 	clone.State = maps.Clone(i.State)
 	clone.Tools = cloneToolSpecs(i.Tools)
+	if i.ReasonLevel != nil {
+		level := *i.ReasonLevel
+		clone.ReasonLevel = &level
+	}
 	return &clone
 }
 

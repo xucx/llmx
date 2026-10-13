@@ -28,6 +28,10 @@ type State struct {
 	// Tools are the tools declared by the newest admitted input that
 	// declared any.
 	Tools []ToolSpec
+	// Model and ReasonLevel are the overrides set by admitted inputs; empty
+	// / nil means the agent definition applies.
+	Model       string
+	ReasonLevel *int
 	// Pending are the tool calls of the newest reply without a result.
 	Pending []PendingCall
 	// Inputs are the input events not admitted yet, in order.
@@ -199,6 +203,12 @@ func (s *State) admitEvent(event *Event) {
 	s.Stopped = nil
 	if input.Tools != nil {
 		s.Tools = input.Tools
+	}
+	if input.Model != "" {
+		s.Model = input.Model
+	}
+	if input.ReasonLevel != nil {
+		s.ReasonLevel = input.ReasonLevel
 	}
 	if input.State != nil || input.Reset {
 		s.patch(input.State, input.Reset)

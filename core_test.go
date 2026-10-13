@@ -605,9 +605,10 @@ func TestBuildMessagesRendersTheConversation(t *testing.T) {
 	}
 }
 
-func TestStateOverridesModelAndReasonLevel(t *testing.T) {
+func TestInputOverridesModelAndReasonLevel(t *testing.T) {
 	in := NewUserInput(InputQueue, "think")
-	in.State = map[string]string{StateModel: "deep", StateReasonLevel: "8"}
+	level := 8
+	in.Model, in.ReasonLevel = "deep", &level
 	s := Fold(numbered(&Event{ID: "q1", Input: in}))
 	effects := Plan(s, &Agent{Model: "fake", ReasonLevel: 0})
 	if len(effects) != 1 || effects[0].CallModel.Model != "deep" || effects[0].CallModel.ReasonLevel != 8 {
