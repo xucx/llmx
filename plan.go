@@ -44,6 +44,15 @@ type EffectEmit struct {
 	Events []*Event
 }
 
+// State keys the conversation may set (through Input.State or Patch) to
+// override the agent definition for the model calls that follow.
+const (
+	// StateModel overrides Agent.Model.
+	StateModel = "llmx.model"
+	// StateReasonLevel overrides Agent.ReasonLevel (an integer, 0-10).
+	StateReasonLevel = "llmx.reasonLevel"
+)
+
 // ErrToolInterrupted answers every tool call an interruption cut short or
 // never started.
 var ErrToolInterrupted = errors.New(
@@ -97,11 +106,18 @@ func Plan(s *State, a *Agent) []Effect {
 				NewStopEvent(id, StopMaxTurn, fmt.Sprintf("max turn %d exceeded", a.MaxTurn)),
 			}}}}
 		}
+		model, level := a.Model, a.ReasonLevel
+		if override := s.KV[StateModel]; override != "" {
+			model = override
+		}
+		if override, err := strconv.Atoi(s.KV[StateReasonLevel]); err == nil && override >= 0 {
+			level = override
+		}
 		return []Effect{{ID: ReplyID(s.Seq), CallModel: &EffectCallModel{
 			BaseSeq:     s.Seq,
-			Model:       a.Model,
+			Model:       model,
 			Instruction: a.Instruction,
-			ReasonLevel: a.ReasonLevel,
+			ReasonLevel: level,
 			Messages:    BuildMessages(s),
 			Tools:       mergeTools(a.Tools, s.Tools),
 		}}}

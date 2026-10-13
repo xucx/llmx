@@ -604,3 +604,17 @@ func TestBuildMessagesRendersTheConversation(t *testing.T) {
 		t.Fatalf("tool result = %+v", got)
 	}
 }
+
+func TestStateOverridesModelAndReasonLevel(t *testing.T) {
+	in := NewUserInput(InputQueue, "think")
+	in.State = map[string]string{StateModel: "deep", StateReasonLevel: "8"}
+	s := Fold(numbered(&Event{ID: "q1", Input: in}))
+	effects := Plan(s, &Agent{Model: "fake", ReasonLevel: 0})
+	if len(effects) != 1 || effects[0].CallModel.Model != "deep" || effects[0].CallModel.ReasonLevel != 8 {
+		t.Fatalf("effects = %+v", effects)
+	}
+	s = Fold(numbered(input("q1", InputQueue, "plain")))
+	if got := Plan(s, &Agent{Model: "fake", ReasonLevel: 3})[0].CallModel; got.Model != "fake" || got.ReasonLevel != 3 {
+		t.Fatalf("defaults not used: %+v", got)
+	}
+}
