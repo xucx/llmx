@@ -253,18 +253,28 @@ func (p *OpenaiProvider) toCompletion(model string, messages []*types.Message, o
 			})
 		case types.MessageRoleUser:
 			var content strings.Builder
+			var parts []*CompletionContentPart
 			for _, part := range msg.Parts {
 				switch {
 				case part.Text != nil:
 					content.WriteString(part.Text.TextWithInstruction())
+					parts = append(parts, &CompletionContentPart{Type: "text", Text: part.Text.TextWithInstruction()})
+				case part.ImageURL != nil:
+					parts = append(parts, &CompletionContentPart{
+						Type:     "image_url",
+						ImageURL: &CompletionImageURL{URL: part.ImageURL.URL, Detail: part.ImageURL.Detail},
+					})
 				default:
 					return nil, fmt.Errorf("%w: openai user message part", types.ErrUnsupported)
 				}
 			}
-			req.Messages = append(req.Messages, &CompletionMessageParam{
-				Role:    string(RoleUser),
-				Content: content.String(),
-			})
+			message := &CompletionMessageParam{Role: string(RoleUser), Content: content.String()}
+			// Images need the array form of content; text-only stays a plain string.
+			if hasImagePart(parts) {
+				message.Content = ""
+				message.ContentParts = parts
+			}
+			req.Messages = append(req.Messages, message)
 		case types.MessageRoleAssistant:
 			toolCalls := []*CompletionToolCall{}
 			message := &CompletionMessageParam{Role: string(RoleAssistant)}
@@ -473,4 +483,13 @@ func mergeDeltaCompletion(to *CompletionRsp, from *CompletionRsp) {
 		}
 	}
 
+}
+
+func hasImagePart(parts []*CompletionContentPart) bool {
+	for _, part := range parts {
+		if part.Type == "image_url" {
+			return true
+		}
+	}
+	return false
 }

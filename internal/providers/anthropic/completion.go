@@ -140,6 +140,20 @@ func toChatMessages(params *anthropic.MessageNewParams, messages []*types.Messag
 					OfText: &anthropic.TextBlockParam{Text: part.Refusal.Text},
 				}
 			case part.ImageURL != nil:
+				// data: URLs are inlined as base64 sources; anthropic's URL source only fetches http(s).
+				if mediaType, data, ok := splitDataURL(part.ImageURL.URL); ok {
+					toPart = &anthropic.ContentBlockParamUnion{
+						OfImage: &anthropic.ImageBlockParam{
+							Source: anthropic.ImageBlockParamSourceUnion{
+								OfBase64: &anthropic.Base64ImageSourceParam{
+									Data:      data,
+									MediaType: anthropic.Base64ImageSourceMediaType(mediaType),
+								},
+							},
+						},
+					}
+					break
+				}
 				toPart = &anthropic.ContentBlockParamUnion{
 					OfImage: &anthropic.ImageBlockParam{
 						Source: anthropic.ImageBlockParamSourceUnion{
@@ -337,4 +351,20 @@ func fromChatCompletion(msg *anthropic.Message) (*types.Completion, error) {
 	}
 
 	return completion, nil
+}
+
+// splitDataURL parses "data:<media type>;base64,<data>"; ok is false for anything else.
+func splitDataURL(url string) (mediaType, data string, ok bool) {
+	if !strings.HasPrefix(url, "data:") {
+		return "", "", false
+	}
+	comma := strings.IndexByte(url, ',')
+	if comma < 0 {
+		return "", "", false
+	}
+	meta := url[len("data:"):comma]
+	if !strings.HasSuffix(meta, ";base64") {
+		return "", "", false
+	}
+	return strings.TrimSuffix(meta, ";base64"), url[comma+1:], true
 }

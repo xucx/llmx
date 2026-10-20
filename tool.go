@@ -58,6 +58,9 @@ type Output struct {
 	Final bool
 	// Patch records a key-value state change alongside the result.
 	Patch map[string]string
+	// Images are pictures returned alongside Value (data URLs or https URLs),
+	// shown to the model right after the result.
+	Images []string
 }
 
 // Ask is what a tool returns to ask a question before answering: the call
@@ -217,6 +220,7 @@ func ToolOutcome(call ToolCall, value any, err error, answered bool) ([]*Event, 
 		}
 		result.Instruction = output.Instruction
 		result.Final = output.Final
+		result.Images = output.Images
 		if output.Value != nil {
 			if text, ok := output.Value.(string); ok {
 				result.Value = text

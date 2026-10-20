@@ -56,6 +56,9 @@ const (
 type Content struct {
 	Text     string `json:"text,omitempty"`
 	ImageURL string `json:"imageUrl,omitempty"`
+	// Instruction adds tagged instructions to the text the model sees, kept
+	// apart from what the user wrote (a reminder of the current time, say).
+	Instruction map[string]string `json:"instruction,omitempty"`
 }
 
 // ToolSpec declares a tool to the model: its name, what it does and the JSON
@@ -118,6 +121,10 @@ type ToolResult struct {
 	Instruction map[string]string `json:"instruction,omitempty"`
 	// Final marks a result the model need not answer.
 	Final bool `json:"final,omitempty"`
+	// Images are pictures the tool returned alongside Value (data URLs or
+	// https URLs). BuildMessages shows them to the model in a user message
+	// right after the result, since tool messages carry only text.
+	Images []string `json:"images,omitempty"`
 }
 
 // ToolAsk is a question a tool raises before answering its call, typically
@@ -355,7 +362,13 @@ func (i *Input) Clone() *Input {
 		return nil
 	}
 	clone := *i
-	clone.Content = append([]Content(nil), i.Content...)
+	if i.Content != nil {
+		clone.Content = make([]Content, len(i.Content))
+		for index, content := range i.Content {
+			content.Instruction = maps.Clone(content.Instruction)
+			clone.Content[index] = content
+		}
+	}
 	clone.State = maps.Clone(i.State)
 	clone.Tools = cloneToolSpecs(i.Tools)
 	if i.ReasonLevel != nil {
@@ -395,6 +408,9 @@ func (r *ToolResult) Clone() *ToolResult {
 	}
 	clone := *r
 	clone.Instruction = maps.Clone(r.Instruction)
+	if r.Images != nil {
+		clone.Images = append([]string(nil), r.Images...)
+	}
 	return &clone
 }
 

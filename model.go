@@ -132,10 +132,14 @@ func (x *modelExecutor) Exec(ctx context.Context, s *State, e *Effect) ([]*Event
 			return nil
 		}
 	}
+	messages := call.Messages
+	if !x.acceptsImages(call.Model) {
+		messages = withoutImages(messages)
+	}
 	mctx := &modelContext{
 		Context: ctx,
 		state:   s,
-		request: ModelRequest{Model: call.Model, Messages: call.Messages, Options: options},
+		request: ModelRequest{Model: call.Model, Messages: messages, Options: options},
 	}
 	completion, err := x.handler(mctx)
 	// Whatever happens, what interceptors appended (a compression, say) is
@@ -228,4 +232,49 @@ func (c *modelContext) Append(events ...*Event) error {
 	c.appended = append(c.appended, events...)
 	c.mu.Unlock()
 	return nil
+}
+
+// acceptsImages reports whether the model takes image input; unknown models
+// are assumed not to, so images never break a text-only model.
+func (x *modelExecutor) acceptsImages(name string) bool {
+	if x.models == nil {
+		return true
+	}
+	model, err := x.models.GetModel(name)
+	return err == nil && model.Vision
+}
+
+// ImageOmittedNote replaces each image part for a model that cannot see images.
+const ImageOmittedNote = "[image omitted: this model cannot view images]"
+
+// withoutImages returns the messages with image parts replaced by a note.
+// Messages without images are shared, not copied.
+func withoutImages(messages []*types.Message) []*types.Message {
+	out := make([]*types.Message, 0, len(messages))
+	for _, message := range messages {
+		if message == nil || !hasImage(message) {
+			out = append(out, message)
+			continue
+		}
+		clone := *message
+		clone.Parts = make([]*types.MessagePart, 0, len(message.Parts))
+		for _, part := range message.Parts {
+			if part != nil && part.ImageURL != nil {
+				clone.Parts = append(clone.Parts, &types.MessagePart{Text: &types.MessageText{Text: ImageOmittedNote}})
+				continue
+			}
+			clone.Parts = append(clone.Parts, part)
+		}
+		out = append(out, &clone)
+	}
+	return out
+}
+
+func hasImage(message *types.Message) bool {
+	for _, part := range message.Parts {
+		if part != nil && part.ImageURL != nil {
+			return true
+		}
+	}
+	return false
 }

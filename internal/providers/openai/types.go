@@ -30,6 +30,34 @@ type CompletionMessageParam struct {
 	Refusal          string                `json:"refusal,omitempty"`
 	ToolCalls        []*CompletionToolCall `json:"tool_calls,omitempty"`
 	ToolCallID       string                `json:"tool_call_id,omitempty"`
+	// ContentParts, when set, is sent as the array form of "content" (text and
+	// image_url parts) instead of the plain string in Content.
+	ContentParts []*CompletionContentPart `json:"-"`
+}
+
+// MarshalJSON emits the array form of content when parts are present.
+func (m CompletionMessageParam) MarshalJSON() ([]byte, error) {
+	type plain CompletionMessageParam
+	if len(m.ContentParts) == 0 {
+		return json.Marshal(plain(m))
+	}
+	// The outer Content shadows the embedded string field.
+	return json.Marshal(struct {
+		plain
+		Content []*CompletionContentPart `json:"content"`
+	}{plain: plain(m), Content: m.ContentParts})
+}
+
+// CompletionContentPart is one entry of a multimodal user message.
+type CompletionContentPart struct {
+	Type     string              `json:"type"` // text | image_url
+	Text     string              `json:"text,omitempty"`
+	ImageURL *CompletionImageURL `json:"image_url,omitempty"`
+}
+
+type CompletionImageURL struct {
+	URL    string `json:"url"`
+	Detail string `json:"detail,omitempty"` // auto | low | high
 }
 
 type CompletionToolCall struct {

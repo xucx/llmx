@@ -17,8 +17,41 @@ func BuildMessages(s *State) []*types.Message {
 		if message := eventMessage(event); message != nil {
 			messages = append(messages, message)
 		}
+		if images := toolImagesMessage(event); images != nil {
+			messages = append(messages, images)
+		}
 	}
 	return messages
+}
+
+// ImagesMessageSuffix is appended to a ToolResult event's ID to name the
+// user message that carries the images it returned.
+const ImagesMessageSuffix = ":images"
+
+// toolImagesMessage shows the images a tool returned. Providers accept
+// pictures only in user messages, so they follow the tool message as one
+// with the event's ID plus ImagesMessageSuffix.
+func toolImagesMessage(event *Event) *types.Message {
+	if event.ToolResult == nil || len(event.ToolResult.Images) == 0 || event.ToolResult.Error != "" {
+		return nil
+	}
+	name := event.ToolResult.Name
+	if name == "" {
+		name = event.ToolResult.CallID
+	}
+	message := &types.Message{ID: event.ID + ImagesMessageSuffix, Role: types.MessageRoleUser}
+	message.Parts = append(message.Parts, &types.MessagePart{
+		Text: &types.MessageText{Text: "Images returned by tool " + name + ":"},
+	})
+	for _, url := range event.ToolResult.Images {
+		if url == "" {
+			continue
+		}
+		message.Parts = append(message.Parts, &types.MessagePart{
+			ImageURL: &types.MessageImageURL{URL: url},
+		})
+	}
+	return message
 }
 
 func eventMessage(event *Event) *types.Message {
@@ -29,7 +62,7 @@ func eventMessage(event *Event) *types.Message {
 			switch {
 			case content.Text != "":
 				message.Parts = append(message.Parts, &types.MessagePart{
-					Text: &types.MessageText{Text: content.Text},
+					Text: &types.MessageText{Text: content.Text, Instruction: instructionMap(content.Instruction)},
 				})
 			case content.ImageURL != "":
 				message.Parts = append(message.Parts, &types.MessagePart{
@@ -70,13 +103,7 @@ func eventMessage(event *Event) *types.Message {
 		return message
 	case event.ToolResult != nil:
 		result := event.ToolResult
-		var instruction map[string][]string
-		if len(result.Instruction) > 0 {
-			instruction = make(map[string][]string, len(result.Instruction))
-			for key, value := range result.Instruction {
-				instruction[key] = []string{value}
-			}
-		}
+		instruction := instructionMap(result.Instruction)
 		return &types.Message{ID: event.ID, Role: types.MessageRoleTool, Parts: []*types.MessagePart{{
 			ToolResult: &types.MessageToolResult{
 				ID:          result.CallID,
@@ -89,6 +116,18 @@ func eventMessage(event *Event) *types.Message {
 		}}}
 	}
 	return nil
+}
+
+// instructionMap converts event instructions to the provider form.
+func instructionMap(source map[string]string) map[string][]string {
+	if len(source) == 0 {
+		return nil
+	}
+	instruction := make(map[string][]string, len(source))
+	for key, value := range source {
+		instruction[key] = []string{value}
+	}
+	return instruction
 }
 
 // ToolSpecsToTypes converts tool declarations to the provider tool type.

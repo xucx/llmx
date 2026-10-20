@@ -25,10 +25,12 @@ type ProviderConfig struct {
 }
 
 type ModelConfig struct {
-	Name     string               `yaml:"name"`
-	Model    string               `yaml:"model"`
-	Provider string               `yaml:"provider"`
-	MaxToken int64                `yaml:"maxToken"`
+	Name     string `yaml:"name"`
+	Model    string `yaml:"model"`
+	Provider string `yaml:"provider"`
+	MaxToken int64  `yaml:"maxToken"`
+	// Vision overrides the built-in table: whether the model accepts images.
+	Vision   *bool                `yaml:"vision"`
 	Fallback *ModelConfigFallback `yaml:"fallback"`
 }
 
@@ -51,6 +53,8 @@ type Model struct {
 	Name     string
 	Model    string
 	MaxToken int64
+	// Vision: the model accepts image input (see ModelInfo.Vision).
+	Vision   bool
 	Provider types.Provider
 	Fallback *ModelFallback
 }
@@ -354,6 +358,10 @@ func (m *Models) AddModel(conf ModelConfig) (*Model, error) {
 	if model.MaxToken <= 0 {
 		model.MaxToken = info.MaxToken
 	}
+	model.Vision = info.Vision
+	if conf.Vision != nil {
+		model.Vision = *conf.Vision
+	}
 
 	if conf.Fallback != nil {
 		model.Fallback = &ModelFallback{
@@ -396,6 +404,7 @@ func (m *Models) GetModel(name string) (*Model, error) {
 				Name:     name,
 				Model:    splitNames[1],
 				MaxToken: info.MaxToken,
+				Vision:   info.Vision,
 				Provider: provider,
 			}
 			return model, nil
