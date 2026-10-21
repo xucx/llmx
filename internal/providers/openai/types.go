@@ -80,10 +80,20 @@ type CompletionChoise struct {
 }
 
 type CompletionMessage struct {
-	ReasoningContent string               `json:"reasoning_content"`
-	Content          string               `json:"content"`
-	Refusal          string               `json:"refusal"`
-	ToolCalls        []CompletionToolCall `json:"tool_calls"`
+	ReasoningContent string `json:"reasoning_content"`
+	// Reasoning is where newer vLLM puts the reasoning, leaving reasoning_content empty.
+	Reasoning string               `json:"reasoning"`
+	Content   string               `json:"content"`
+	Refusal   string               `json:"refusal"`
+	ToolCalls []CompletionToolCall `json:"tool_calls"`
+}
+
+// reasoningText returns the reasoning from whichever field the server used.
+func (m *CompletionMessage) reasoningText() string {
+	if m.ReasoningContent != "" {
+		return m.ReasoningContent
+	}
+	return m.Reasoning
 }
 
 type CompletionUsage struct {

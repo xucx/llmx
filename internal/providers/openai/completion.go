@@ -377,10 +377,10 @@ func (p *OpenaiProvider) fromCompletion(from *CompletionRsp, delta bool) (*types
 
 		if message != nil {
 
-			if message.ReasoningContent != "" {
+			if reasoning := message.reasoningText(); reasoning != "" {
 				to.Message.Parts = append(to.Message.Parts, &types.MessagePart{
 					Reasoning: &types.MessageReasoning{
-						Text: message.ReasoningContent,
+						Text: reasoning,
 					},
 				})
 			}
@@ -461,7 +461,7 @@ func mergeDeltaCompletion(to *CompletionRsp, from *CompletionRsp) {
 	message := to.Choices[0].Message
 
 	message.Content += choice.Delta.Content
-	message.ReasoningContent += choice.Delta.ReasoningContent
+	message.ReasoningContent += choice.Delta.reasoningText()
 	message.Refusal += choice.Delta.Refusal
 	for i := range choice.Delta.ToolCalls {
 		deltaTool := &choice.Delta.ToolCalls[i]
