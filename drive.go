@@ -145,23 +145,26 @@ func watchInterrupt(runCtx context.Context, sess Session, seq int64, cancel cont
 	done := make(chan struct{})
 	go func() {
 		for {
+			// Register before loading so interrupts appended before the watcher
+			// starts or between Load and waiting cannot be missed.
 			tail := sess.Tail(runCtx)
+			events, _, err := sess.Load(runCtx)
+			if err == nil {
+				for _, event := range events {
+					if event.Seq > seq && event.Input != nil && event.Input.Mode == InputInterrupt {
+						cancel(ErrToolInterrupted)
+						return
+					}
+				}
+			}
+			// Also wait after a failed Load, especially when runCtx is
+			// canceled, instead of spinning on repeated load failures.
 			select {
 			case <-done:
 				return
 			case <-runCtx.Done():
 				return
 			case <-tail:
-			}
-			events, _, err := sess.Load(runCtx)
-			if err != nil {
-				continue
-			}
-			for _, event := range events {
-				if event.Seq > seq && event.Input != nil && event.Input.Mode == InputInterrupt {
-					cancel(ErrToolInterrupted)
-					return
-				}
 			}
 		}
 	}()
