@@ -3,6 +3,7 @@ package llmx
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"strconv"
 
 	"github.com/xucx/llmx/types"
@@ -37,6 +38,10 @@ type EffectCallTool struct {
 	Answer *ToolAnswer
 	// Since is the append time of the reply that made the call.
 	Since int64
+	// State is the key-value state at planning time, so an executor can
+	// decide from the effect alone whether the call is routed to it (a
+	// device executor checks the target device, say).
+	State map[string]string
 }
 
 // EffectEmit appends bookkeeping events: cancellations, stops.
@@ -85,6 +90,7 @@ func Plan(s *State, a *Agent) []Effect {
 					Ask:    pending.Ask,
 					Answer: pending.Answer,
 					Since:  pending.Since,
+					State:  maps.Clone(s.KV),
 				},
 			})
 		}

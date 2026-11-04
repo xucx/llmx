@@ -7,7 +7,9 @@ import (
 // PendingCall is a tool call of the newest reply that has no result yet.
 type PendingCall struct {
 	Call ToolCall
-	// Since is the append time of the reply that made the call.
+	// Since is the append time of the reply that made the call. Once the
+	// call is answered it moves to the append time of the answer, so a
+	// deadline on Since measures the executor, not the person who answered.
 	Since int64
 	// Ask is set while the tool waits for an answer; Answer once it arrived
 	// and the tool has not run again yet.
@@ -113,6 +115,9 @@ func (s *State) apply(event *Event) {
 	case event.ToolAnswer != nil:
 		if pending := s.pending(event.ToolAnswer.CallID); pending != nil && pending.Ask != nil {
 			pending.Answer = event.ToolAnswer
+			if event.At > 0 {
+				pending.Since = event.At
+			}
 		}
 	case event.Patch != nil:
 		s.patch(event.Patch.KV, event.Patch.Reset)

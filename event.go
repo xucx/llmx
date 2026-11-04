@@ -78,8 +78,10 @@ type Input struct {
 	State map[string]string `json:"state,omitempty"`
 	Reset bool              `json:"reset,omitempty"`
 	// Tools declares the tools the sender can run, visible to the model from
-	// this input on until another input declares tools.
-	Tools []ToolSpec `json:"tools,omitempty"`
+	// this input on until another input declares tools. Nil keeps the
+	// current declaration; an empty list clears it. The two must survive
+	// JSON (null vs []), so the field is never omitted.
+	Tools []ToolSpec `json:"tools"`
 	// Model and ReasonLevel override the agent definition for the model calls
 	// from this input on, until another input sets them. Empty / nil keep the
 	// current values. They are the library's own settings, kept apart from

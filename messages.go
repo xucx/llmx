@@ -68,6 +68,13 @@ func eventMessage(event *Event) *types.Message {
 				message.Parts = append(message.Parts, &types.MessagePart{
 					ImageURL: &types.MessageImageURL{URL: content.ImageURL},
 				})
+			case len(content.Instruction) > 0:
+				// Instruction-only content: shown to the model as tagged
+				// text, invisible to Input.Text() (a UI keeps it out of the
+				// user's bubble).
+				message.Parts = append(message.Parts, &types.MessagePart{
+					Text: &types.MessageText{Instruction: instructionMap(content.Instruction)},
+				})
 			}
 		}
 		if len(message.Parts) == 0 {
